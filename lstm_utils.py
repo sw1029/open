@@ -122,6 +122,8 @@ def create_sequences(
     seq_length,
     predict_length,
     future_features=None,
+    store_col: str = '영업장명_encoded',
+    item_col: str = '메뉴명_encoded',
 ):
     """Create rolling window sequences.
 
@@ -132,12 +134,15 @@ def create_sequences(
     """
 
     xs, ys, future_feats, item_ids = [], [], [], []
+    store_idxs, item_idxs = [], []
     for item_id, group in data.groupby('영업장명_메뉴명'):
         feature_data = group[features].values
         target_data = group[target].values
         future_feat_data = (
             group[future_features].values if future_features is not None else None
         )
+        store_idx = group[store_col].iloc[0]
+        item_idx = group[item_col].iloc[0]
         max_start = len(group) - seq_length - predict_length + 1
         for i in range(max_start):
             xs.append(feature_data[i : i + seq_length])
@@ -149,12 +154,23 @@ def create_sequences(
                     ]
                 )
             item_ids.append(item_id)
+            store_idxs.append(store_idx)
+            item_idxs.append(item_idx)
     xs_arr = np.array(xs)
     ys_arr = np.array(ys)
     item_ids_arr = np.array(item_ids)
+    store_idx_arr = np.array(store_idxs)
+    item_idx_arr = np.array(item_idxs)
     if future_features is not None:
-        return xs_arr, ys_arr, np.array(future_feats), item_ids_arr
-    return xs_arr, ys_arr, item_ids_arr
+        return (
+            xs_arr,
+            ys_arr,
+            np.array(future_feats),
+            item_ids_arr,
+            store_idx_arr,
+            item_idx_arr,
+        )
+    return xs_arr, ys_arr, item_ids_arr, store_idx_arr, item_idx_arr
 
 
 def time_warp(arr: np.ndarray, scale: float) -> np.ndarray:
@@ -175,13 +191,24 @@ def augment_sequences(
     y: np.ndarray,
     item_ids: np.ndarray,
     future_feats: np.ndarray | None = None,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
+    store_idxs: np.ndarray | None = None,
+    item_idxs: np.ndarray | None = None,
+) -> Tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray | None,
+    np.ndarray | None,
+    np.ndarray | None,
+]:
     """Augment sequences for specific stores using noise, scaling and time warping."""
 
     target_keywords = ['담하', '미라시아']
-    aug_X, aug_y, aug_ids, aug_future = [], [], [], []
+    aug_X, aug_y, aug_ids, aug_future, aug_store, aug_item = [], [], [], [], [], []
     for idx, (x_seq, y_seq, item_id) in enumerate(zip(X, y, item_ids)):
         fut_seq = future_feats[idx] if future_feats is not None else None
+        store_idx = store_idxs[idx] if store_idxs is not None else None
+        item_idx = item_idxs[idx] if item_idxs is not None else None
         if any(keyword in item_id for keyword in target_keywords):
             noise_x = x_seq + np.random.normal(0, 0.01, x_seq.shape)
             noise_y = y_seq + np.random.normal(0, 0.01, y_seq.shape)
@@ -190,6 +217,10 @@ def augment_sequences(
             aug_ids.append(item_id)
             if fut_seq is not None:
                 aug_future.append(fut_seq)
+            if store_idx is not None:
+                aug_store.append(store_idx)
+            if item_idx is not None:
+                aug_item.append(item_idx)
 
             scale_factor = np.random.uniform(0.9, 1.1)
             aug_X.append(x_seq * scale_factor)
@@ -197,6 +228,10 @@ def augment_sequences(
             aug_ids.append(item_id)
             if fut_seq is not None:
                 aug_future.append(fut_seq)
+            if store_idx is not None:
+                aug_store.append(store_idx)
+            if item_idx is not None:
+                aug_item.append(item_idx)
 
             warp_factor = np.random.uniform(0.8, 1.2)
             aug_X.append(time_warp(x_seq, warp_factor))
@@ -204,6 +239,10 @@ def augment_sequences(
             aug_ids.append(item_id)
             if fut_seq is not None:
                 aug_future.append(fut_seq)
+            if store_idx is not None:
+                aug_store.append(store_idx)
+            if item_idx is not None:
+                aug_item.append(item_idx)
 
     if aug_X:
         X = np.concatenate([X, np.array(aug_X)], axis=0)
@@ -211,23 +250,36 @@ def augment_sequences(
         item_ids = np.concatenate([item_ids, np.array(aug_ids)], axis=0)
         if future_feats is not None:
             future_feats = np.concatenate([future_feats, np.array(aug_future)], axis=0)
-    return X, y, item_ids, future_feats
+        if store_idxs is not None:
+            store_idxs = np.concatenate([store_idxs, np.array(aug_store)], axis=0)
+        if item_idxs is not None:
+            item_idxs = np.concatenate([item_idxs, np.array(aug_item)], axis=0)
+    return X, y, item_ids, future_feats, store_idxs, item_idxs
 
 
 class SalesDataset(Dataset):
-    """Dataset returning sequences, targets, ids and future exogenous features."""
+    """Dataset returning sequences, targets, ids, future features and embedding indices."""
 
-    def __init__(self, X, y, item_ids, future_feats):
+    def __init__(self, X, y, item_ids, future_feats, store_idxs, item_idxs):
         self.X = torch.tensor(X, dtype=torch.float32)
         self.y = torch.tensor(y, dtype=torch.float32)
         self.future_feats = torch.tensor(future_feats, dtype=torch.float32)
         self.item_ids = item_ids
+        self.store_idxs = torch.tensor(store_idxs, dtype=torch.long)
+        self.item_idxs = torch.tensor(item_idxs, dtype=torch.long)
 
     def __len__(self):
         return len(self.X)
 
     def __getitem__(self, idx):
-        return self.X[idx], self.y[idx], self.item_ids[idx], self.future_feats[idx]
+        return (
+            self.X[idx],
+            self.y[idx],
+            self.item_ids[idx],
+            self.future_feats[idx],
+            self.store_idxs[idx],
+            self.item_idxs[idx],
+        )
 
 
 class LSTMAttention(nn.Module):
@@ -388,12 +440,19 @@ class Seq2Seq(nn.Module):
         cnn_channels: int | None = None,
         kernel_size: int = 3,
         future_feat_dim: int = 0,
+        num_stores: int = 0,
+        num_items: int = 0,
+        emb_dim_store: int = 0,
+        emb_dim_item: int = 0,
     ):
         super().__init__()
+        self.store_emb = nn.Embedding(num_stores, emb_dim_store)
+        self.item_emb = nn.Embedding(num_items, emb_dim_item)
+        total_input_size = input_size + emb_dim_store + emb_dim_item
         if cnn_channels is None:
-            cnn_channels = input_size
+            cnn_channels = total_input_size
         self.encoder = Encoder(
-            input_size,
+            total_input_size,
             hidden_size,
             num_layers,
             cnn_channels,
@@ -408,11 +467,13 @@ class Seq2Seq(nn.Module):
             future_feat_dim,
         )
         # Projection for residual connection from the last encoder input.
-        self.residual_proj = nn.Linear(input_size, decoder_steps)
+        self.residual_proj = nn.Linear(total_input_size, decoder_steps)
 
     def forward(
         self,
         x: torch.Tensor,
+        store_idx: torch.Tensor,
+        item_idx: torch.Tensor,
         target_len: int | None = None,
         targets: torch.Tensor | None = None,
         scheduled_sampling_prob: float = 0.0,
@@ -420,6 +481,9 @@ class Seq2Seq(nn.Module):
     ):
         if future_feats is None:
             raise ValueError("future_feats must be provided for decoder inputs")
+        store_e = self.store_emb(store_idx).unsqueeze(1).expand(-1, x.size(1), -1)
+        item_e = self.item_emb(item_idx).unsqueeze(1).expand(-1, x.size(1), -1)
+        x = torch.cat([x, store_e, item_e], dim=2)
         encoder_outputs, hidden = self.encoder(x)
         outputs = self.decoder(
             encoder_outputs,
@@ -556,9 +620,20 @@ def prepare_datasets(sequence_length: int, predict_length: int, batch_size: int)
     if combined_nan_count != expected_test_nans:
         raise ValueError("Combined dataframe NaN mismatch")
 
-    features_to_scale = ['dayofweek', 'month', '영업장명_encoded', '메뉴명_encoded',
-                         'lag_1', 'lag_7', 'lag_14', 'lag_28', 'buddy_lag_1_sales',
-                         'roll7', 'roll28', 'is_holiday', 'season', 'is_event']
+    features_to_scale = [
+        'dayofweek',
+        'month',
+        'lag_1',
+        'lag_7',
+        'lag_14',
+        'lag_28',
+        'buddy_lag_1_sales',
+        'roll7',
+        'roll28',
+        'is_holiday',
+        'season',
+        'is_event',
+    ]
     # Features available for future time steps (do not rely on past sales)
     future_features = ['dayofweek', 'month', 'is_holiday', 'season', 'is_event']
     target_col = '매출수량'
@@ -580,9 +655,12 @@ def prepare_datasets(sequence_length: int, predict_length: int, batch_size: int)
             combined_df.loc[combined_df['영업장명_메뉴명'] == item_id, target_col] = scaler_item.transform(item_sales).flatten()
             scalers[item_id] = scaler_item
 
+    num_stores = combined_df['영업장명_encoded'].nunique()
+    num_items = combined_df['메뉴명_encoded'].nunique()
+
     features = features_to_scale
     train_data = combined_df[combined_df['매출수량'].notna()]
-    X, y, future_feat_array, item_ids = create_sequences(
+    X, y, future_feat_array, item_ids, store_idx_arr, item_idx_arr = create_sequences(
         train_data,
         features,
         target_col,
@@ -592,23 +670,31 @@ def prepare_datasets(sequence_length: int, predict_length: int, batch_size: int)
     )
 
     # Augment sequences for specified stores to expand training data
-    X, y, item_ids, future_feat_array = augment_sequences(
-        X, y, item_ids, future_feat_array
+    (
+        X,
+        y,
+        item_ids,
+        future_feat_array,
+        store_idx_arr,
+        item_idx_arr,
+    ) = augment_sequences(
+        X, y, item_ids, future_feat_array, store_idx_arr, item_idx_arr
     )
 
-    X_train, X_val = X[: int(len(X) * 0.9)], X[int(len(X) * 0.9) :]
-    y_train, y_val = y[: int(len(y) * 0.9)], y[int(len(y) * 0.9) :]
-    future_train, future_val = (
-        future_feat_array[: int(len(future_feat_array) * 0.9)],
-        future_feat_array[int(len(future_feat_array) * 0.9) :],
-    )
-    item_ids_train, item_ids_val = (
-        item_ids[: int(len(item_ids) * 0.9)],
-        item_ids[int(len(item_ids) * 0.9) :],
-    )
+    split_idx = int(len(X) * 0.9)
+    X_train, X_val = X[:split_idx], X[split_idx:]
+    y_train, y_val = y[:split_idx], y[split_idx:]
+    future_train, future_val = future_feat_array[:split_idx], future_feat_array[split_idx:]
+    item_ids_train, item_ids_val = item_ids[:split_idx], item_ids[split_idx:]
+    store_train, store_val = store_idx_arr[:split_idx], store_idx_arr[split_idx:]
+    item_train, item_val = item_idx_arr[:split_idx], item_idx_arr[split_idx:]
 
-    train_dataset = SalesDataset(X_train, y_train, item_ids_train, future_train)
-    val_dataset = SalesDataset(X_val, y_val, item_ids_val, future_val)
+    train_dataset = SalesDataset(
+        X_train, y_train, item_ids_train, future_train, store_train, item_train
+    )
+    val_dataset = SalesDataset(
+        X_val, y_val, item_ids_val, future_val, store_val, item_val
+    )
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
@@ -631,6 +717,8 @@ def prepare_datasets(sequence_length: int, predict_length: int, batch_size: int)
         submission_to_date_map,
         test_indices,
         item_weights,
+        num_stores,
+        num_items,
     )
 
 
@@ -699,8 +787,18 @@ def predict_and_submit(
                     future_tensor = torch.tensor(
                         np.array([future_inputs]), dtype=torch.float32
                     ).to(DEVICE)
+                    store_tensor = torch.tensor(
+                        [sequence_data['영업장명_encoded'].iloc[0]],
+                        dtype=torch.long,
+                    ).to(DEVICE)
+                    item_tensor = torch.tensor(
+                        [sequence_data['메뉴명_encoded'].iloc[0]],
+                        dtype=torch.long,
+                    ).to(DEVICE)
                     prediction_scaled = model(
                         input_tensor,
+                        store_tensor,
+                        item_tensor,
                         target_len=len(current_dates),
                         future_feats=future_tensor,
                     ).cpu().numpy()[0]
