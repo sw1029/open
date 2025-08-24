@@ -25,6 +25,14 @@ PATIENCE = 10
 DEFAULT_PREDICT_LENGTH = 7
 DEFAULT_NUM_HEADS = 4
 
+SCHEDULED_SAMPLING_PROB = 0.1
+
+
+def update_sampling_prob(epoch: int) -> None:
+    """Linearly increase scheduled sampling probability with epoch."""
+    global SCHEDULED_SAMPLING_PROB
+    SCHEDULED_SAMPLING_PROB = min(0.5, 0.1 + 0.02 * epoch)
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -114,6 +122,7 @@ def main():
         stage_best_smape = float("inf")
         patience_counter = 0
         for epoch in epoch_iterator:
+            update_sampling_prob(epoch)
             model.train()
             for inputs, labels, batch_item_ids in train_loader:
                 inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
@@ -123,7 +132,7 @@ def main():
                     .to(DEVICE)
                 )
                 optimizer.zero_grad()
-                outputs = model(inputs, curr_len)
+                outputs = model(inputs, curr_len, labels, SCHEDULED_SAMPLING_PROB)
                 l1_loss = criterion(outputs, labels) * weights
                 smape_loss = smape_loss_fn(outputs, labels, weights)
                 loss = (l1_loss + smape_loss).mean()
@@ -184,7 +193,18 @@ def main():
                     all_labels_unscaled[i][all_labels_unscaled[i] < 0] = 0
 
             val_smape = smape(all_labels_unscaled, all_preds_unscaled)
-            epoch_iterator.set_postfix(val_loss=f"{val_loss:.6f}", val_smape=f"{val_smape:.4f}")
+            epoch_iterator.set_postfix(
+                val_loss=f"{val_loss:.6f}",
+                val_smape=f"{val_smape:.4f}",
+                ss_prob=f"{SCHEDULED_SAMPLING_PROB:.2f}"
+            )
+            logging.info(
+                "Stage %s Epoch %s: ss_prob=%.2f val_smape=%.4f",
+                stage_idx,
+                epoch + 1,
+                SCHEDULED_SAMPLING_PROB,
+                val_smape,
+            )
 
             if val_smape < stage_best_smape:
                 stage_best_smape = val_smape
