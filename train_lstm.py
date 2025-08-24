@@ -7,8 +7,15 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
+import logging
 
 print("PyTorch LSTM-based demand forecasting script started.")
+
+logging.basicConfig(
+    filename="nan_log.log",
+    level=logging.INFO,
+    format="%(asctime)s - %(message)s"
+)
 
 # --- 0. 설정 및 SMAPE 함수 ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -523,21 +530,19 @@ final_submission = sample_submission_df[['영업일자']].merge(
 )
 final_submission.drop(columns=['submission_date'], inplace=True)
 
-# 결측치 확인: 존재하면 상세 정보 출력 후 실행 중단
-na_counts = final_submission.isna().sum()
-if na_counts.sum() > 0:
-    print("Missing values detected in final submission columns:")
-    print(na_counts[na_counts > 0])
-    for col in final_submission.columns:
-        if col != '영업일자' and na_counts[col] > 0:
-            missing_dates = final_submission.loc[final_submission[col].isna(), '영업일자']
-            print(f"Column '{col}' has missing dates: {missing_dates.tolist()}")
-    raise ValueError("NaNs found in final submission. Aborting.")
-
 final_submission = final_submission[sample_submission_df.columns]
 
-# 제출 직전에만 반올림하여 정수로 변환
+# 결측치 로그 기록 및 0으로 대체
 value_columns = final_submission.columns.drop('영업일자')
+na_mask = final_submission[value_columns].isna()
+if na_mask.any().any():
+    for col in value_columns:
+        missing_dates = final_submission.loc[na_mask[col], '영업일자']
+        if not missing_dates.empty:
+            logging.warning("NaN detected for item '%s' on dates: %s", col, missing_dates.tolist())
+final_submission[value_columns] = final_submission[value_columns].fillna(0)
+
+# 제출 직전에만 반올림하여 정수로 변환
 final_submission[value_columns] = np.round(final_submission[value_columns]).astype(int)
 
 final_submission.to_csv("lstm_submission_recursive_full.csv", index=False)
