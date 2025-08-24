@@ -8,6 +8,7 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 import logging
+import holidays
 
 print("PyTorch LSTM-based demand forecasting script started.")
 
@@ -149,19 +150,13 @@ def create_features_test(df):
     df['month'] = df['영업일자'].dt.month.fillna(-1).astype(int)
     return df
 
-def load_calendar_features(df, holiday_path='holidays.csv', event_path='events.csv'):
-    """
-    Load holiday, season and event information. If corresponding files are
-    missing, default values are used.
-    """
+def load_calendar_features(df, event_path='events.csv'):
+    """Load holiday, season and event information."""
     df['영업일자'] = pd.to_datetime(df['영업일자'])
 
-    if os.path.exists(holiday_path):
-        holiday_df = pd.read_csv(holiday_path)
-        holiday_dates = pd.to_datetime(holiday_df['date']).dt.strftime('%Y-%m-%d').tolist()
-        df['is_holiday'] = df['영업일자'].dt.strftime('%Y-%m-%d').isin(holiday_dates).astype(int)
-    else:
-        df['is_holiday'] = 0
+    years = df['영업일자'].dt.year.unique()
+    kr_holidays = holidays.KR(years=years, expand=True, observed=True)
+    df['is_holiday'] = df['영업일자'].dt.date.isin(kr_holidays).astype(int)
 
     if os.path.exists(event_path):
         event_df = pd.read_csv(event_path)
