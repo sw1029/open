@@ -119,6 +119,10 @@ def main():
         num_items,
     ) = prepare_datasets(SEQUENCE_LENGTH, curriculum_lengths[0], BATCH_SIZE)
 
+    assert (
+        combined_df.loc[combined_df['매출수량'].notna(), 'source'] == 'train'
+    ).all(), "Non-train data detected in training set"
+
     if cnn_channels is None:
         cnn_channels = len(features) + store_emb_dim + item_emb_dim
 
@@ -167,6 +171,9 @@ def main():
                 num_stores,
                 num_items,
             ) = prepare_datasets(SEQUENCE_LENGTH, curr_len, BATCH_SIZE)
+            assert (
+                combined_df.loc[combined_df['매출수량'].notna(), 'source'] == 'train'
+            ).all(), "Non-train data detected in training set"
         for param_group in optimizer.param_groups:
             param_group["lr"] = LEARNING_RATE / 25
         warmup_epochs = min(2, epochs)

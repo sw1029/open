@@ -115,6 +115,44 @@ def load_calendar_features(df: pd.DataFrame, event_path: str = 'events.csv') -> 
     return df
 
 
+def load_and_prepare_test_data(test_pattern: str = 'test/TEST_*.csv'):
+    """Load and preprocess test CSV files.
+
+    This is separated from :func:`prepare_datasets` to ensure evaluation data
+    handling is isolated from training data preparation.
+    """
+    test_files = glob.glob(test_pattern)
+    test_df_list = []
+    for file in test_files:
+        temp_df = pd.read_csv(file)
+        test_id = os.path.splitext(os.path.basename(file))[0]
+        temp_df['영업일자'] = pd.to_datetime(temp_df['영업일자'])
+        for _, g in temp_df.groupby('영업장명_메뉴명'):
+            g = g.sort_values('영업일자')
+            past = g.iloc[:-7].copy()
+            past['submission_date'] = past['영업일자'].dt.strftime('%Y-%m-%d')
+            future = g.tail(7).copy().reset_index(drop=True)
+            future['submission_date'] = [f"{test_id}+{i+1}일" for i in range(len(future))]
+            future['매출수량'] = np.nan
+            past['test_id'] = test_id
+            future['test_id'] = test_id
+            test_df_list.append(pd.concat([past, future], ignore_index=True))
+    test_df = pd.concat(test_df_list, ignore_index=True)
+
+    submission_date_map = test_df.set_index(test_df['영업일자'].astype(str))['submission_date'].to_dict()
+    submission_to_date_map = test_df.set_index('submission_date')['영업일자'].astype(str).to_dict()
+
+    expected_test_nans = 7 * test_df[['test_id', '영업장명_메뉴명']].drop_duplicates().shape[0]
+    actual_test_nans = test_df['매출수량'].isna().sum()
+    if actual_test_nans != expected_test_nans:
+        raise ValueError("Unexpected number of NaNs in test data")
+    nans_per_item = test_df[test_df['매출수량'].isna()].groupby(['test_id', '영업장명_메뉴명']).size()
+    if not (nans_per_item == 7).all():
+        raise ValueError("Each test_id/item pair must have exactly 7 NaNs.")
+
+    return test_df, submission_date_map, submission_to_date_map
+
+
 def create_sequences(
     data: pd.DataFrame,
     features,
@@ -504,35 +542,7 @@ def prepare_datasets(sequence_length: int, predict_length: int, batch_size: int)
     logging.info("Preparing datasets with sequence_length=%s predict_length=%s", sequence_length, predict_length)
 
     train_df = pd.read_csv('train/train.csv')
-    test_files = glob.glob('test/TEST_*.csv')
-    test_df_list = []
-    for file in test_files:
-        temp_df = pd.read_csv(file)
-        test_id = os.path.splitext(os.path.basename(file))[0]
-        temp_df['영업일자'] = pd.to_datetime(temp_df['영업일자'])
-        for _, g in temp_df.groupby('영업장명_메뉴명'):
-            g = g.sort_values('영업일자')
-            past = g.iloc[:-7].copy()
-            past['submission_date'] = past['영업일자'].dt.strftime('%Y-%m-%d')
-            future = g.tail(7).copy().reset_index(drop=True)
-            future['submission_date'] = [f"{test_id}+{i+1}일" for i in range(len(future))]
-            future['매출수량'] = np.nan
-            past['test_id'] = test_id
-            future['test_id'] = test_id
-            test_df_list.append(pd.concat([past, future], ignore_index=True))
-    test_df = pd.concat(test_df_list, ignore_index=True)
-
-    submission_date_map = test_df.set_index(test_df['영업일자'].astype(str))['submission_date'].to_dict()
-    submission_to_date_map = test_df.set_index('submission_date')['영업일자'].astype(str).to_dict()
-
-    expected_test_nans = 7 * test_df[['test_id', '영업장명_메뉴명']].drop_duplicates().shape[0]
-    actual_test_nans = test_df['매출수량'].isna().sum()
-    if actual_test_nans != expected_test_nans:
-        raise ValueError("Unexpected number of NaNs in test data")
-    nans_per_item = test_df[test_df['매출수량'].isna()].groupby(['test_id', '영업장명_메뉴명']).size()
-    if not (nans_per_item == 7).all():
-        raise ValueError("Each test_id/item pair must have exactly 7 NaNs.")
-
+    test_df, submission_date_map, submission_to_date_map = load_and_prepare_test_data()
     sample_submission_df = pd.read_csv('sample_submission.csv')
 
     train_df = create_features_train(train_df)
@@ -659,7 +669,7 @@ def prepare_datasets(sequence_length: int, predict_length: int, batch_size: int)
     num_items = combined_df['메뉴명_encoded'].nunique()
 
     features = features_to_scale
-    train_data = combined_df[combined_df['매출수량'].notna()]
+    train_data = combined_df[(combined_df['source'] == 'train') & (combined_df['매출수량'].notna())]
     X, y, future_feat_array, item_ids, store_idx_arr, item_idx_arr = create_sequences(
         train_data,
         features,
