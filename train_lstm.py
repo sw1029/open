@@ -447,14 +447,29 @@ for item_id in tqdm(submission_df_for_inverse['영업장명_메뉴명'].unique()
 # 최종적으로 recursive_df에 역변환된 값을 반영
 recursive_df.loc[test_indices, '매출수량'] = submission_df_for_inverse['매출수량']
 
-# 반올림하여 정수로 변환
-recursive_df.loc[test_indices, '매출수량'] = np.round(recursive_df.loc[test_indices, '매출수량']).astype(int)
-
 # --- 5. 제출 파일 생성 ---
-submission_df = recursive_df.loc[test_indices].pivot_table(index='영업일자', columns='영업장명_메뉴명', values='매출수량').reset_index()
-final_submission = sample_submission_df[['영업일자']].merge(submission_df, on='영업일자', how='left')
-final_submission.fillna(0, inplace=True)
+submission_df = (
+    recursive_df.loc[test_indices]
+    .pivot_table(index='영업일자', columns='영업장명_메뉴명', values='매출수량')
+    .reset_index()
+)
+final_submission = sample_submission_df[['영업일자']].merge(
+    submission_df, on='영업일자', how='left'
+)
+
+# 결측치 확인 및 필요한 경우에만 0으로 대체
+na_counts = final_submission.isna().sum()
+if na_counts.sum() > 0:
+    print("Missing values detected in final submission columns:")
+    print(na_counts[na_counts > 0])
+    cols_to_fill = [col for col in final_submission.columns if col != '영업일자' and na_counts[col] > 0]
+    final_submission[cols_to_fill] = final_submission[cols_to_fill].fillna(0)
+
 final_submission = final_submission[sample_submission_df.columns]
+
+# 제출 직전에만 반올림하여 정수로 변환
+value_columns = final_submission.columns.drop('영업일자')
+final_submission[value_columns] = np.round(final_submission[value_columns]).astype(int)
 
 final_submission.to_csv("lstm_submission_recursive_full.csv", index=False)
 print("Submission file created successfully at: lstm_submission_recursive_full.csv")
