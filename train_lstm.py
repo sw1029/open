@@ -297,9 +297,12 @@ with torch.no_grad():
             # 입력 시퀀스 준비 (current_date 이전 데이터 사용)
             item_history = recursive_df[(recursive_df['영업장명_메뉴명'] == item_id) & (recursive_df['영업일자'] < current_date)]
             sequence_data = item_history.tail(SEQUENCE_LENGTH)
-            
+
             if len(sequence_data) < SEQUENCE_LENGTH:
-                predicted_value_scaled = 0.0
+                if len(sequence_data) > 0 and not sequence_data[target_col].isna().all():
+                    predicted_value_scaled = sequence_data[target_col].iloc[-1]
+                else:
+                    predicted_value_scaled = 0.01
             else:
                 input_features = sequence_data[features].values
                 input_tensor = torch.tensor([input_features], dtype=torch.float32).to(DEVICE)
