@@ -196,6 +196,83 @@ class LSTMAttention(nn.Module):
         return out
 
 
+class Encoder(nn.Module):
+    """LSTM encoder that processes input sequences."""
+
+    def __init__(self, input_size: int, hidden_size: int, num_layers: int):
+        super().__init__()
+        self.lstm = nn.LSTM(
+            input_size, hidden_size, num_layers, batch_first=True, dropout=0.2
+        )
+
+    def forward(self, x: torch.Tensor):
+        outputs, hidden = self.lstm(x)
+        return outputs, hidden
+
+
+class Decoder(nn.Module):
+    """LSTM decoder with multi-head attention over encoder outputs."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_layers: int,
+        output_size: int,
+        num_heads: int,
+        decoder_steps: int,
+    ):
+        super().__init__()
+        self.decoder_steps = decoder_steps
+        self.lstm = nn.LSTM(
+            output_size, hidden_size, num_layers, batch_first=True, dropout=0.2
+        )
+        self.attn = nn.MultiheadAttention(
+            embed_dim=hidden_size, num_heads=num_heads, batch_first=True
+        )
+        self.fc = nn.Linear(hidden_size, output_size)
+        self.activation = nn.LeakyReLU()
+
+    def forward(
+        self,
+        encoder_outputs: torch.Tensor,
+        hidden,
+        target_len: int | None = None,
+    ):
+        if target_len is None:
+            target_len = self.decoder_steps
+        batch_size = encoder_outputs.size(0)
+        decoder_input = torch.zeros(batch_size, target_len, 1, device=encoder_outputs.device)
+        decoder_outputs, hidden = self.lstm(decoder_input, hidden)
+        attn_output, _ = self.attn(decoder_outputs, encoder_outputs, encoder_outputs)
+        output = self.fc(attn_output)
+        output = self.activation(output)
+        return output.squeeze(-1)
+
+
+class Seq2Seq(nn.Module):
+    """Sequence-to-sequence model with LSTM encoder and attention decoder."""
+
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int,
+        num_layers: int,
+        output_size: int,
+        num_heads: int,
+        decoder_steps: int,
+    ):
+        super().__init__()
+        self.encoder = Encoder(input_size, hidden_size, num_layers)
+        self.decoder = Decoder(
+            hidden_size, num_layers, output_size, num_heads, decoder_steps
+        )
+
+    def forward(self, x: torch.Tensor, target_len: int | None = None):
+        encoder_outputs, hidden = self.encoder(x)
+        outputs = self.decoder(encoder_outputs, hidden, target_len)
+        return outputs
+
+
 def prepare_datasets(sequence_length: int, predict_length: int, batch_size: int):
     """Load data, apply feature engineering and create train/val dataloaders."""
     logging.info("Preparing datasets with sequence_length=%s predict_length=%s", sequence_length, predict_length)

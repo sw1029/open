@@ -1,3 +1,4 @@
+import argparse
 import logging
 import numpy as np
 import torch
@@ -7,7 +8,7 @@ from tqdm import tqdm
 from lstm_utils import (
     DEVICE,
     SMAPELoss,
-    LSTMAttention,
+    Seq2Seq,
     prepare_datasets,
     predict_and_submit,
     smape,
@@ -15,16 +16,34 @@ from lstm_utils import (
 
 
 SEQUENCE_LENGTH = 14
-PREDICT_LENGTH = 7
 BATCH_SIZE = 64
 LEARNING_RATE = 0.001
 NUM_EPOCHS = 50
 HIDDEN_SIZE = 128
 NUM_LAYERS = 2
 PATIENCE = 10
+DEFAULT_PREDICT_LENGTH = 7
+DEFAULT_NUM_HEADS = 4
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--num_heads",
+        type=int,
+        default=DEFAULT_NUM_HEADS,
+        help="Number of attention heads in the decoder.",
+    )
+    parser.add_argument(
+        "--decoder_steps",
+        type=int,
+        default=DEFAULT_PREDICT_LENGTH,
+        help="Number of time steps for the decoder to predict.",
+    )
+    args = parser.parse_args()
+    predict_length = args.decoder_steps
+    num_heads = args.num_heads
+
     print("PyTorch LSTM-based demand forecasting script started.")
 
     (
@@ -39,13 +58,15 @@ def main():
         submission_to_date_map,
         test_indices,
         item_weights,
-    ) = prepare_datasets(SEQUENCE_LENGTH, PREDICT_LENGTH, BATCH_SIZE)
+    ) = prepare_datasets(SEQUENCE_LENGTH, predict_length, BATCH_SIZE)
 
-    model = LSTMAttention(
+    model = Seq2Seq(
         input_size=len(features),
         hidden_size=HIDDEN_SIZE,
         num_layers=NUM_LAYERS,
-        output_size=PREDICT_LENGTH,
+        output_size=1,
+        num_heads=num_heads,
+        decoder_steps=predict_length,
     ).to(DEVICE)
     criterion = nn.SmoothL1Loss(reduction="none")
     smape_loss_fn = SMAPELoss(reduction="none")
@@ -68,7 +89,7 @@ def main():
                 .to(DEVICE)
             )
             optimizer.zero_grad()
-            outputs = model(inputs)
+            outputs = model(inputs, predict_length)
             l1_loss = criterion(outputs, labels) * weights
             smape_loss = smape_loss_fn(outputs, labels, weights)
             loss = (l1_loss + smape_loss).mean()
@@ -85,12 +106,15 @@ def main():
                     .unsqueeze(1)
                     .to(DEVICE)
                 )
-                outputs = model(inputs)
-                batch_loss = (criterion(outputs, labels) * weights + smape_loss_fn(outputs, labels, weights)).mean()
+                outputs = model(inputs, predict_length)
+                batch_loss = (
+                    criterion(outputs, labels) * weights
+                    + smape_loss_fn(outputs, labels, weights)
+                ).mean()
                 val_loss += batch_loss.item()
                 all_preds.append(outputs.cpu().numpy())
                 all_labels.append(labels.cpu().numpy())
-                all_item_ids.append(np.repeat(batch_item_ids, PREDICT_LENGTH))
+                all_item_ids.append(np.repeat(batch_item_ids, predict_length))
 
         val_loss /= len(val_loader)
         scheduler.step(val_loss)
@@ -155,7 +179,7 @@ def main():
         submission_to_date_map,
         test_indices,
         SEQUENCE_LENGTH,
-        PREDICT_LENGTH,
+        predict_length,
     )
 
 
