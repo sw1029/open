@@ -19,16 +19,34 @@ def smape(y_true, y_pred, eps: float = 1e-8):
 # --- 1. 데이터 로딩 ---
 print("Step 1: Loading data...")
 train_df = pd.read_csv('train/train.csv')
-test_files = glob.glob('test/*.csv')
+test_files = glob.glob('test/TEST_*.csv')
 test_df_list = []
 for file in test_files:
     temp_df = pd.read_csv(file)
     test_id = os.path.splitext(os.path.basename(file))[0]
-    temp_df['test_id'] = test_id
     temp_df['영업일자'] = pd.to_datetime(temp_df['영업일자'])
-    temp_df['submission_date'] = [f"{test_id}+{i+1}일" for i in range(len(temp_df))]
-    test_df_list.append(temp_df)
+
+    for _, g in temp_df.groupby('영업장명_메뉴명'):
+        g = g.sort_values('영업일자')
+        past = g.iloc[:-7].copy()
+        past['submission_date'] = past['영업일자'].dt.strftime('%Y-%m-%d')
+        future = g.tail(7).copy().reset_index(drop=True)
+        future['submission_date'] = [f"{test_id}+{i+1}일" for i in range(len(future))]
+        future['매출수량'] = np.nan
+        past['test_id'] = test_id
+        future['test_id'] = test_id
+        test_df_list.append(pd.concat([past, future], ignore_index=True))
+
 test_df = pd.concat(test_df_list, ignore_index=True)
+expected_test_nans = 7 * test_df['영업장명_메뉴명'].nunique()
+actual_test_nans = test_df['매출수량'].isna().sum()
+if actual_test_nans != expected_test_nans:
+    raise ValueError(f"Unexpected number of NaNs in test data: {actual_test_nans} (expected {expected_test_nans})")
+
+nans_per_item = test_df[test_df['매출수량'].isna()].groupby('영업장명_메뉴명').size()
+if not (nans_per_item == 7).all():
+    raise ValueError("Not all item-date combinations were generated in test data.")
+
 sample_submission_df = pd.read_csv('sample_submission.csv')
 
 # --- 2. 피처 엔지니어링 ---
