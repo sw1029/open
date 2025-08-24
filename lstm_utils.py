@@ -155,7 +155,11 @@ def load_and_prepare_test_data(test_pattern: str = 'test/TEST_*.csv'):
         temp_df['영업일자'] = pd.to_datetime(temp_df['영업일자'])
         for _, g in temp_df.groupby('영업장명_메뉴명'):
             g = g.sort_values('영업일자')
-            past = g.iloc[:-7].copy()
+            past = g.iloc[-35:-7].copy()
+            if (len(g) - 7) > 28 and len(past) != 28:
+                raise ValueError(
+                    f"{test_id}-{g['영업장명_메뉴명'].iloc[0]}: expected 28 past days, got {len(past)}"
+                )
             past['submission_date'] = past['영업일자'].dt.strftime('%Y-%m-%d')
             future = g.tail(7).copy().reset_index(drop=True)
             future['submission_date'] = [f"{test_id}+{i+1}일" for i in range(len(future))]
@@ -794,6 +798,10 @@ def predict_and_submit(
                     (recursive_df['영업일자'] < cutoff_date)
                 ]
                 sequence_data = item_history.tail(sequence_length)
+                if len(item_history) > sequence_length and len(sequence_data) != sequence_length:
+                    raise ValueError(
+                        f"Model input length for {item_id} is {len(sequence_data)}, expected {sequence_length}"
+                    )
                 if len(sequence_data) < sequence_length or sequence_data[target_col].isna().all():
                     buddy_id = recursive_df.loc[
                         recursive_df['영업장명_메뉴명'] == item_id, 'best_buddy'
