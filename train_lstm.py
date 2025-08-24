@@ -337,7 +337,22 @@ with torch.no_grad():
             item_history = recursive_df[(recursive_df['영업장명_메뉴명'] == item_id) & (recursive_df['영업일자'] < current_dates[0])]
             sequence_data = item_history.tail(SEQUENCE_LENGTH)
             if len(sequence_data) < SEQUENCE_LENGTH or sequence_data[target_col].isna().all():
-                predicted_seq = np.repeat(0.01, len(current_dates))
+                buddy_id = recursive_df.loc[
+                    recursive_df['영업장명_메뉴명'] == item_id, 'best_buddy'
+                ].iloc[0]
+                init_val = np.nan
+                if pd.notna(buddy_id):
+                    buddy_history = recursive_df[
+                        (recursive_df['영업장명_메뉴명'] == buddy_id)
+                        & (recursive_df['영업일자'] < current_dates[0])
+                    ]
+                    buddy_sales = buddy_history[target_col].dropna()
+                    if not buddy_sales.empty:
+                        init_val = buddy_sales.iloc[-1]
+                if np.isnan(init_val):
+                    overall_mean = recursive_df[target_col].dropna().mean()
+                    init_val = overall_mean if not np.isnan(overall_mean) else 0.1
+                predicted_seq = np.repeat(init_val, len(current_dates))
             else:
                 input_features = sequence_data[features].values
                 input_tensor = torch.tensor([input_features], dtype=torch.float32).to(DEVICE)
