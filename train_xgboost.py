@@ -52,9 +52,6 @@ sample_submission_df = pd.read_csv('sample_submission.csv')
 # --- 2. 피처 엔지니어링 ---
 print("Step 2: Feature Engineering...")
 
-# 전체 데이터프레임 생성 (나중에 lag 피처 생성에 사용)
-combined_df = pd.concat([train_df, test_df], ignore_index=True)
-
 def create_features(df):
     df[['영업장명', '메뉴명']] = df['영업장명_메뉴명'].str.split('_', n=1, expand=True)
     df['영업일자'] = pd.to_datetime(df['영업일자'])
@@ -65,20 +62,26 @@ def create_features(df):
     df['weekofyear'] = df['영업일자'].dt.isocalendar().week.astype(int)
     return df
 
-combined_df = create_features(combined_df)
+train_df = create_features(train_df)
+test_df = create_features(test_df)
 
 for col in ['영업장명', '메뉴명']:
     le = LabelEncoder()
-    le.fit(combined_df[col].unique())
-    combined_df[col+'_encoded'] = le.transform(combined_df[col])
+    le.fit(pd.concat([train_df[col], test_df[col]], axis=0).unique())
+    train_df[col + '_encoded'] = le.transform(train_df[col])
+    test_df[col + '_encoded'] = le.transform(test_df[col])
 
-combined_df = combined_df.sort_values(by=['영업장명_메뉴명', '영업일자'])
+train_df = train_df.sort_values(by=['영업장명_메뉴명', '영업일자'])
+test_df = test_df.sort_values(by=['test_id', '영업장명_메뉴명', '영업일자'])
 
 print("Creating lag and rolling features...")
-lags = [1, 7, 14, 28] # 1일전 lag 추가
+lags = [1, 7, 14, 28]
 for lag in lags:
-    combined_df[f'lag_{lag}'] = combined_df.groupby('영업장명_메뉴명')['매출수량'].shift(lag)
-combined_df['rolling_mean_7'] = combined_df.groupby('영업장명_메뉴명')['매출수량'].transform(lambda x: x.shift(1).rolling(7).mean())
+    train_df[f'lag_{lag}'] = train_df.groupby('영업장명_메뉴명')['매출수량'].shift(lag)
+    test_df[f'lag_{lag}'] = test_df.groupby(['test_id', '영업장명_메뉴명'])['매출수량'].shift(lag)
+
+train_df['rolling_mean_7'] = train_df.groupby('영업장명_메뉴명')['매출수량'].transform(lambda x: x.shift(1).rolling(7).mean())
+test_df['rolling_mean_7'] = test_df.groupby(['test_id', '영업장명_메뉴명'])['매출수량'].transform(lambda x: x.shift(1).rolling(7).mean())
 
 # --- 2.1. 상관관계 피처 추가 ---
 print("Creating correlation features...")
@@ -88,36 +91,45 @@ corr_matrices = {os.path.basename(f).replace('.csv', ''): pd.read_csv(f, index_c
 best_buddy_map = {}
 for store, corr_matrix in corr_matrices.items():
     for menu in corr_matrix.columns:
-        # 자기 자신을 제외하고 가장 상관관계가 높은 메뉴 찾기
         best_buddy = corr_matrix[menu].drop(menu).idxmax()
         best_buddy_map[(store, menu)] = best_buddy
 
-# 각 메뉴의 "최고의 짝꿍" 메뉴명을 매핑
-combined_df['best_buddy'] = combined_df.set_index(['영업장명', '메뉴명']).index.map(best_buddy_map.get)
+train_df['best_buddy'] = train_df.set_index(['영업장명', '메뉴명']).index.map(best_buddy_map.get)
+test_df['best_buddy'] = test_df.set_index(['영업장명', '메뉴명']).index.map(best_buddy_map.get)
 
-# 1일 전 판매량 데이터를 담은 임시 데이터프레임 생성
-lag1_sales_df = combined_df[['영업일자', '영업장명', '메뉴명', 'lag_1']].copy()
-lag1_sales_df.rename(columns={'lag_1': 'buddy_lag_1_sales'}, inplace=True)
-
-# 원본 데이터에 "최고의 짝꿍"의 1일 전 판매량을 병합
-combined_df = pd.merge(
-    combined_df, 
-    lag1_sales_df, 
-    left_on=['영업일자', '영업장명', 'best_buddy'], 
-    right_on=['영업일자', '영업장명', '메뉴명'], 
+lag1_sales_df_train = train_df[['영업일자', '영업장명', '메뉴명', 'lag_1']].copy()
+lag1_sales_df_train.rename(columns={'lag_1': 'buddy_lag_1_sales'}, inplace=True)
+train_df = pd.merge(
+    train_df,
+    lag1_sales_df_train,
+    left_on=['영업일자', '영업장명', 'best_buddy'],
+    right_on=['영업일자', '영업장명', '메뉴명'],
     how='left',
     suffixes=('', '_buddy')
 )
+train_df.drop(columns=['메뉴명_buddy', 'best_buddy'], inplace=True)
 
-combined_df.drop(columns=['메뉴명_buddy', 'best_buddy'], inplace=True)
+lag1_sales_df_test = test_df[['test_id', '영업일자', '영업장명', '메뉴명', 'lag_1']].copy()
+lag1_sales_df_test.rename(columns={'lag_1': 'buddy_lag_1_sales'}, inplace=True)
+test_df = pd.merge(
+    test_df,
+    lag1_sales_df_test,
+    left_on=['test_id', '영업일자', '영업장명', 'best_buddy'],
+    right_on=['test_id', '영업일자', '영업장명', '메뉴명'],
+    how='left',
+    suffixes=('', '_buddy')
+)
+test_df.drop(columns=['메뉴명_buddy', 'best_buddy'], inplace=True)
 
+lag_cols = [f'lag_{lag}' for lag in lags] + ['rolling_mean_7', 'buddy_lag_1_sales']
+train_df[lag_cols] = train_df[lag_cols].fillna(0)
+test_df[lag_cols] = test_df[lag_cols].fillna(0)
 
 # --- 3. 모델 훈련 및 검증 ---
 print("Step 3: Training and validating XGBoost model...")
 
-# 학습 데이터와 테스트 데이터 다시 분리 (기존 코드와 동일)
-train_df = combined_df[combined_df['매출수량'].notna()]
-test_df = combined_df[combined_df['매출수량'].isna()].copy() # .copy() 추가
+train_df = train_df[train_df['매출수량'].notna()]
+test_df = test_df[test_df['매출수량'].isna()].copy()
 
 features = [
     'year', 'month', 'day', 'dayofweek', 'weekofyear',
