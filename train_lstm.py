@@ -113,14 +113,22 @@ test_df = pd.concat(test_df_list, ignore_index=True)
 # submission_date <-> 실제 날짜 매핑 생성
 submission_date_map = test_df.set_index(test_df['영업일자'].astype(str))['submission_date'].to_dict()
 submission_to_date_map = test_df.set_index('submission_date')['영업일자'].astype(str).to_dict()
-expected_test_nans = 7 * test_df['영업장명_메뉴명'].nunique()
+expected_test_nans = (
+    7 * test_df[['test_id', '영업장명_메뉴명']].drop_duplicates().shape[0]
+)
 actual_test_nans = test_df['매출수량'].isna().sum()
 if actual_test_nans != expected_test_nans:
-    raise ValueError(f"Unexpected number of NaNs in test data: {actual_test_nans} (expected {expected_test_nans})")
+    raise ValueError(
+        f"Unexpected number of NaNs in test data: {actual_test_nans} (expected {expected_test_nans})"
+    )
 
-nans_per_item = test_df[test_df['매출수량'].isna()].groupby('영업장명_메뉴명').size()
+nans_per_item = (
+    test_df[test_df['매출수량'].isna()]
+    .groupby(['test_id', '영업장명_메뉴명'])
+    .size()
+)
 if not (nans_per_item == 7).all():
-    raise ValueError("Not all item-date combinations were generated in test data.")
+    raise ValueError("Each test_id/item pair must have exactly 7 NaNs.")
 
 sample_submission_df = pd.read_csv('sample_submission.csv')
 
