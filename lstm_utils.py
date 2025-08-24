@@ -112,16 +112,46 @@ def load_calendar_features(df: pd.DataFrame, event_path: str = 'events.csv') -> 
     return df
 
 
-def create_sequences(data: pd.DataFrame, features, target, seq_length, predict_length):
-    xs, ys, item_ids = [], [], []
+def create_sequences(
+    data: pd.DataFrame,
+    features,
+    target,
+    seq_length,
+    predict_length,
+    future_features=None,
+):
+    """Create rolling window sequences.
+
+    When ``future_features`` is provided, an additional array containing the
+    features for the prediction horizon is returned for each sequence. These
+    features should correspond to exogenous variables that are known in
+    advance (e.g. day of week, holiday flags).
+    """
+
+    xs, ys, future_feats, item_ids = [], [], [], []
     for item_id, group in data.groupby('영업장명_메뉴명'):
         feature_data = group[features].values
         target_data = group[target].values
-        for i in range(len(group) - seq_length - predict_length + 1):
-            xs.append(feature_data[i:i+seq_length])
-            ys.append(target_data[i+seq_length:i+seq_length+predict_length])
+        future_feat_data = (
+            group[future_features].values if future_features is not None else None
+        )
+        max_start = len(group) - seq_length - predict_length + 1
+        for i in range(max_start):
+            xs.append(feature_data[i : i + seq_length])
+            ys.append(target_data[i + seq_length : i + seq_length + predict_length])
+            if future_features is not None:
+                future_feats.append(
+                    future_feat_data[
+                        i + seq_length : i + seq_length + predict_length
+                    ]
+                )
             item_ids.append(item_id)
-    return np.array(xs), np.array(ys), np.array(item_ids)
+    xs_arr = np.array(xs)
+    ys_arr = np.array(ys)
+    item_ids_arr = np.array(item_ids)
+    if future_features is not None:
+        return xs_arr, ys_arr, np.array(future_feats), item_ids_arr
+    return xs_arr, ys_arr, item_ids_arr
 
 
 def time_warp(arr: np.ndarray, scale: float) -> np.ndarray:
@@ -137,46 +167,64 @@ def time_warp(arr: np.ndarray, scale: float) -> np.ndarray:
     return warped
 
 
-def augment_sequences(X: np.ndarray, y: np.ndarray, item_ids: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def augment_sequences(
+    X: np.ndarray,
+    y: np.ndarray,
+    item_ids: np.ndarray,
+    future_feats: np.ndarray | None = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
     """Augment sequences for specific stores using noise, scaling and time warping."""
+
     target_keywords = ['담하', '미라시아']
-    aug_X, aug_y, aug_ids = [], [], []
-    for x_seq, y_seq, item_id in zip(X, y, item_ids):
+    aug_X, aug_y, aug_ids, aug_future = [], [], [], []
+    for idx, (x_seq, y_seq, item_id) in enumerate(zip(X, y, item_ids)):
+        fut_seq = future_feats[idx] if future_feats is not None else None
         if any(keyword in item_id for keyword in target_keywords):
             noise_x = x_seq + np.random.normal(0, 0.01, x_seq.shape)
             noise_y = y_seq + np.random.normal(0, 0.01, y_seq.shape)
             aug_X.append(noise_x)
             aug_y.append(noise_y)
             aug_ids.append(item_id)
+            if fut_seq is not None:
+                aug_future.append(fut_seq)
 
             scale_factor = np.random.uniform(0.9, 1.1)
             aug_X.append(x_seq * scale_factor)
             aug_y.append(y_seq * scale_factor)
             aug_ids.append(item_id)
+            if fut_seq is not None:
+                aug_future.append(fut_seq)
 
             warp_factor = np.random.uniform(0.8, 1.2)
             aug_X.append(time_warp(x_seq, warp_factor))
             aug_y.append(time_warp(y_seq, warp_factor))
             aug_ids.append(item_id)
+            if fut_seq is not None:
+                aug_future.append(fut_seq)
 
     if aug_X:
         X = np.concatenate([X, np.array(aug_X)], axis=0)
         y = np.concatenate([y, np.array(aug_y)], axis=0)
         item_ids = np.concatenate([item_ids, np.array(aug_ids)], axis=0)
-    return X, y, item_ids
+        if future_feats is not None:
+            future_feats = np.concatenate([future_feats, np.array(aug_future)], axis=0)
+    return X, y, item_ids, future_feats
 
 
 class SalesDataset(Dataset):
-    def __init__(self, X, y, item_ids):
+    """Dataset returning sequences, targets, ids and future exogenous features."""
+
+    def __init__(self, X, y, item_ids, future_feats):
         self.X = torch.tensor(X, dtype=torch.float32)
         self.y = torch.tensor(y, dtype=torch.float32)
+        self.future_feats = torch.tensor(future_feats, dtype=torch.float32)
         self.item_ids = item_ids
 
     def __len__(self):
         return len(self.X)
 
     def __getitem__(self, idx):
-        return self.X[idx], self.y[idx], self.item_ids[idx]
+        return self.X[idx], self.y[idx], self.item_ids[idx], self.future_feats[idx]
 
 
 class LSTMAttention(nn.Module):
@@ -249,13 +297,20 @@ class Decoder(nn.Module):
         output_size: int,
         num_heads: int,
         decoder_steps: int,
+        future_feat_dim: int,
     ):
         super().__init__()
         if num_layers < 3:
             raise ValueError("Decoder expects num_layers to be at least 3")
         self.decoder_steps = decoder_steps
+        self.output_size = output_size
+        self.future_feat_dim = future_feat_dim
         self.lstm = nn.LSTM(
-            output_size, hidden_size, num_layers, batch_first=True, dropout=0.2
+            output_size + future_feat_dim,
+            hidden_size,
+            num_layers,
+            batch_first=True,
+            dropout=0.2,
         )
         # Expect encoder outputs and hidden states of size ``hidden_size`` (i.e.,
         # twice the base encoder hidden size due to bidirectionality)
@@ -269,6 +324,7 @@ class Decoder(nn.Module):
         self,
         encoder_outputs: torch.Tensor,
         hidden,
+        future_feats: torch.Tensor,
         target_len: int | None = None,
         targets: torch.Tensor | None = None,
         scheduled_sampling_prob: float = 0.0,
@@ -283,10 +339,14 @@ class Decoder(nn.Module):
             target_len = self.decoder_steps
         batch_size = encoder_outputs.size(0)
 
-        decoder_input = torch.zeros(batch_size, 1, 1, device=encoder_outputs.device)
+        prev_output = torch.zeros(
+            batch_size, 1, self.output_size, device=encoder_outputs.device
+        )
         decoder_hidden = hidden
         outputs = []
         for t in range(target_len):
+            feat_t = future_feats[:, t].unsqueeze(1)
+            decoder_input = torch.cat([prev_output, feat_t], dim=2)
             decoder_output, decoder_hidden = self.lstm(decoder_input, decoder_hidden)
             attn_output, _ = self.attn(decoder_output, encoder_outputs, encoder_outputs)
             step_output = self.fc(attn_output)
@@ -294,18 +354,18 @@ class Decoder(nn.Module):
             outputs.append(step_output)
 
             if targets is not None and self.training:
-                teacher_input = targets[:, t].view(batch_size, 1, 1)
+                teacher_input = targets[:, t].view(batch_size, 1, self.output_size)
                 use_model_pred = (
                     torch.rand(batch_size, 1, 1, device=encoder_outputs.device)
                     < scheduled_sampling_prob
                 )
-                decoder_input = torch.where(
+                prev_output = torch.where(
                     use_model_pred,
                     step_output.detach(),
                     teacher_input,
                 )
             else:
-                decoder_input = step_output.detach()
+                prev_output = step_output.detach()
 
         output = torch.cat(outputs, dim=1).squeeze(-1)
         return output
@@ -324,6 +384,7 @@ class Seq2Seq(nn.Module):
         decoder_steps: int,
         cnn_channels: int | None = None,
         kernel_size: int = 3,
+        future_feat_dim: int = 0,
     ):
         super().__init__()
         if cnn_channels is None:
@@ -336,7 +397,12 @@ class Seq2Seq(nn.Module):
             kernel_size,
         )
         self.decoder = Decoder(
-            hidden_size * 2, num_layers, output_size, num_heads, decoder_steps
+            hidden_size * 2,
+            num_layers,
+            output_size,
+            num_heads,
+            decoder_steps,
+            future_feat_dim,
         )
         # Projection for residual connection from the last encoder input.
         self.residual_proj = nn.Linear(input_size, decoder_steps)
@@ -347,11 +413,15 @@ class Seq2Seq(nn.Module):
         target_len: int | None = None,
         targets: torch.Tensor | None = None,
         scheduled_sampling_prob: float = 0.0,
+        future_feats: torch.Tensor | None = None,
     ):
+        if future_feats is None:
+            raise ValueError("future_feats must be provided for decoder inputs")
         encoder_outputs, hidden = self.encoder(x)
         outputs = self.decoder(
             encoder_outputs,
             hidden,
+            future_feats,
             target_len,
             targets,
             scheduled_sampling_prob,
@@ -486,6 +556,8 @@ def prepare_datasets(sequence_length: int, predict_length: int, batch_size: int)
     features_to_scale = ['dayofweek', 'month', '영업장명_encoded', '메뉴명_encoded',
                          'lag_1', 'lag_7', 'lag_14', 'lag_28', 'buddy_lag_1_sales',
                          'roll7', 'roll28', 'is_holiday', 'season', 'is_event']
+    # Features available for future time steps (do not rely on past sales)
+    future_features = ['dayofweek', 'month', 'is_holiday', 'season', 'is_event']
     target_col = '매출수량'
 
     combined_df.loc[combined_df[target_col].notna(), target_col] = \
@@ -507,17 +579,33 @@ def prepare_datasets(sequence_length: int, predict_length: int, batch_size: int)
 
     features = features_to_scale
     train_data = combined_df[combined_df['매출수량'].notna()]
-    X, y, item_ids = create_sequences(train_data, features, target_col, sequence_length, predict_length)
+    X, y, future_feat_array, item_ids = create_sequences(
+        train_data,
+        features,
+        target_col,
+        sequence_length,
+        predict_length,
+        future_features,
+    )
 
     # Augment sequences for specified stores to expand training data
-    X, y, item_ids = augment_sequences(X, y, item_ids)
+    X, y, item_ids, future_feat_array = augment_sequences(
+        X, y, item_ids, future_feat_array
+    )
 
-    X_train, X_val = X[:int(len(X)*0.9)], X[int(len(X)*0.9):]
-    y_train, y_val = y[:int(len(y)*0.9)], y[int(len(y)*0.9):]
-    item_ids_train, item_ids_val = item_ids[:int(len(item_ids)*0.9)], item_ids[int(len(item_ids)*0.9):]
+    X_train, X_val = X[: int(len(X) * 0.9)], X[int(len(X) * 0.9) :]
+    y_train, y_val = y[: int(len(y) * 0.9)], y[int(len(y) * 0.9) :]
+    future_train, future_val = (
+        future_feat_array[: int(len(future_feat_array) * 0.9)],
+        future_feat_array[int(len(future_feat_array) * 0.9) :],
+    )
+    item_ids_train, item_ids_val = (
+        item_ids[: int(len(item_ids) * 0.9)],
+        item_ids[int(len(item_ids) * 0.9) :],
+    )
 
-    train_dataset = SalesDataset(X_train, y_train, item_ids_train)
-    val_dataset = SalesDataset(X_val, y_val, item_ids_val)
+    train_dataset = SalesDataset(X_train, y_train, item_ids_train, future_train)
+    val_dataset = SalesDataset(X_val, y_val, item_ids_val, future_val)
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
@@ -533,6 +621,7 @@ def prepare_datasets(sequence_length: int, predict_length: int, batch_size: int)
         scalers,
         combined_df,
         features,
+        future_features,
         target_col,
         sample_submission_df,
         submission_date_map,
@@ -542,11 +631,21 @@ def prepare_datasets(sequence_length: int, predict_length: int, batch_size: int)
     )
 
 
-def predict_and_submit(model: nn.Module, combined_df: pd.DataFrame, scalers: Dict[str, MinMaxScaler],
-                        features, target_col: str, sample_submission_df: pd.DataFrame,
-                        submission_date_map: Dict[str, str], submission_to_date_map: Dict[str, str],
-                        test_indices, sequence_length: int, predict_length: int,
-                        output_path: str = "lstm_attention_submission.csv"):
+def predict_and_submit(
+    model: nn.Module,
+    combined_df: pd.DataFrame,
+    scalers: Dict[str, MinMaxScaler],
+    features,
+    future_features,
+    target_col: str,
+    sample_submission_df: pd.DataFrame,
+    submission_date_map: Dict[str, str],
+    submission_to_date_map: Dict[str, str],
+    test_indices,
+    sequence_length: int,
+    predict_length: int,
+    output_path: str = "lstm_attention_submission.csv",
+):
     model.eval()
     recursive_df = combined_df.copy()
     prediction_dates = sorted(
@@ -587,9 +686,22 @@ def predict_and_submit(model: nn.Module, combined_df: pd.DataFrame, scalers: Dic
                     predicted_seq = np.repeat(init_val, len(current_dates))
                 else:
                     input_features = sequence_data[features].values
-                    input_tensor = torch.tensor(np.array([input_features]), dtype=torch.float32).to(DEVICE)
-                    prediction_scaled = model(input_tensor).cpu().numpy()[0]
-                    predicted_seq = prediction_scaled[:len(current_dates)]
+                    future_inputs = recursive_df[
+                        (recursive_df['영업장명_메뉴명'] == item_id)
+                        & (recursive_df['submission_date'].isin(current_dates))
+                    ][future_features].values
+                    input_tensor = torch.tensor(
+                        np.array([input_features]), dtype=torch.float32
+                    ).to(DEVICE)
+                    future_tensor = torch.tensor(
+                        np.array([future_inputs]), dtype=torch.float32
+                    ).to(DEVICE)
+                    prediction_scaled = model(
+                        input_tensor,
+                        target_len=len(current_dates),
+                        future_feats=future_tensor,
+                    ).cpu().numpy()[0]
+                    predicted_seq = prediction_scaled[: len(current_dates)]
                 batch_predictions[item_id] = predicted_seq
 
             for offset, current_date in enumerate(current_dates):

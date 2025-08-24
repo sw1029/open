@@ -51,6 +51,7 @@ def objective(trial):
         scalers,
         combined_df,
         features,
+        future_features,
         target_col,
         sample_submission_df,
         submission_date_map,
@@ -66,6 +67,7 @@ def objective(trial):
         num_heads=num_heads,
         decoder_steps=decoder_steps,
         output_size=1,
+        future_feat_dim=len(future_features),
     ).to(DEVICE)
     criterion = nn.SmoothL1Loss()
     smape_loss_fn = SMAPELoss()
@@ -88,6 +90,7 @@ def objective(trial):
                 scalers,
                 combined_df,
                 features,
+                future_features,
                 target_col,
                 sample_submission_df,
                 submission_date_map,
@@ -99,15 +102,25 @@ def objective(trial):
         for epoch in range(epochs_per_stage[stage_idx]):
             update_sampling_prob(epoch)
             model.train()
-            for inputs, labels, batch_item_ids in train_loader:
-                inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
+            for inputs, labels, batch_item_ids, future_feats in train_loader:
+                inputs, labels, future_feats = (
+                    inputs.to(DEVICE),
+                    labels.to(DEVICE),
+                    future_feats.to(DEVICE),
+                )
                 weights = (
                     torch.tensor([item_weights[item] for item in batch_item_ids], dtype=torch.float32)
                     .unsqueeze(1)
                     .to(DEVICE)
                 )
                 optimizer.zero_grad()
-                outputs = model(inputs, curr_len, labels, SCHEDULED_SAMPLING_PROB)
+                outputs = model(
+                    inputs,
+                    curr_len,
+                    labels,
+                    SCHEDULED_SAMPLING_PROB,
+                    future_feats,
+                )
                 loss = (
                     criterion(outputs, labels) * weights
                     + smape_loss_fn(outputs, labels, weights)
@@ -118,14 +131,18 @@ def objective(trial):
     model.eval()
     val_loss, all_preds, all_labels, all_item_ids = 0, [], [], []
     with torch.no_grad():
-        for inputs, labels, batch_item_ids in val_loader:
-            inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
+        for inputs, labels, batch_item_ids, future_feats in val_loader:
+            inputs, labels, future_feats = (
+                inputs.to(DEVICE),
+                labels.to(DEVICE),
+                future_feats.to(DEVICE),
+            )
             weights = (
                 torch.tensor([item_weights[item] for item in batch_item_ids], dtype=torch.float32)
                 .unsqueeze(1)
                 .to(DEVICE)
             )
-            outputs = model(inputs, STAGE_LENGTHS[-1])
+            outputs = model(inputs, STAGE_LENGTHS[-1], future_feats=future_feats)
             batch_loss = (
                 criterion(outputs, labels) * weights
                 + smape_loss_fn(outputs, labels, weights)
@@ -183,6 +200,7 @@ best_params = best_trial.params
     scalers,
     combined_df,
     features,
+    future_features,
     target_col,
     sample_submission_df,
     submission_date_map,
@@ -198,6 +216,7 @@ best_model = Seq2Seq(
     num_heads=best_params["num_heads"],
     decoder_steps=PREDICT_LENGTH,
     output_size=1,
+    future_feat_dim=len(future_features),
 ).to(DEVICE)
 best_model_path = best_trial.user_attrs.get("best_model_path")
 if best_model_path:
@@ -216,6 +235,7 @@ for epoch in tqdm(range(RETRAIN_EPOCHS), desc="Curriculum training"):
         scalers,
         combined_df,
         features,
+        future_features,
         target_col,
         sample_submission_df,
         submission_date_map,
@@ -226,15 +246,25 @@ for epoch in tqdm(range(RETRAIN_EPOCHS), desc="Curriculum training"):
 
     update_sampling_prob(epoch)
     best_model.train()
-    for inputs, labels, batch_item_ids in train_loader:
-        inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
+    for inputs, labels, batch_item_ids, future_feats in train_loader:
+        inputs, labels, future_feats = (
+            inputs.to(DEVICE),
+            labels.to(DEVICE),
+            future_feats.to(DEVICE),
+        )
         weights = (
             torch.tensor([item_weights[item] for item in batch_item_ids], dtype=torch.float32)
             .unsqueeze(1)
             .to(DEVICE)
         )
         optimizer.zero_grad()
-        outputs = best_model(inputs, PREDICT_LENGTH, labels, SCHEDULED_SAMPLING_PROB)
+        outputs = best_model(
+            inputs,
+            PREDICT_LENGTH,
+            labels,
+            SCHEDULED_SAMPLING_PROB,
+            future_feats,
+        )
         l1_loss = criterion(outputs, labels) * weights
         smape_loss = smape_loss_fn(outputs, labels, weights)
         loss = (l1_loss + smape_loss).mean()
@@ -244,14 +274,18 @@ for epoch in tqdm(range(RETRAIN_EPOCHS), desc="Curriculum training"):
     best_model.eval()
     val_loss, all_preds, all_labels, all_item_ids = 0, [], [], []
     with torch.no_grad():
-        for inputs, labels, batch_item_ids in val_loader:
-            inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
+        for inputs, labels, batch_item_ids, future_feats in val_loader:
+            inputs, labels, future_feats = (
+                inputs.to(DEVICE),
+                labels.to(DEVICE),
+                future_feats.to(DEVICE),
+            )
             weights = (
                 torch.tensor([item_weights[item] for item in batch_item_ids], dtype=torch.float32)
                 .unsqueeze(1)
                 .to(DEVICE)
             )
-            outputs = best_model(inputs, PREDICT_LENGTH)
+            outputs = best_model(inputs, PREDICT_LENGTH, future_feats=future_feats)
             batch_loss = (
                 criterion(outputs, labels) * weights
                 + smape_loss_fn(outputs, labels, weights)
@@ -307,6 +341,7 @@ for epoch in tqdm(range(RETRAIN_EPOCHS), desc="Curriculum training"):
     scalers,
     combined_df,
     features,
+    future_features,
     target_col,
     sample_submission_df,
     submission_date_map,
@@ -322,6 +357,7 @@ predict_and_submit(
     combined_df,
     scalers,
     features,
+    future_features,
     target_col,
     sample_submission_df,
     submission_date_map,
