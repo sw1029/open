@@ -556,5 +556,5 @@ final_submission[value_columns] = final_submission[value_columns].fillna(0)
 # 제출 직전에만 반올림하여 정수로 변환
 final_submission[value_columns] = np.round(final_submission[value_columns]).astype(int)
 
-final_submission.to_csv("lstm_submission_recursive_full.csv", index=False)
+final_submission.to_csv("result.csv", index=False)
 print("Submission file created successfully at: lstm_submission_recursive_full.csv")
