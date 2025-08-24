@@ -80,7 +80,7 @@ def objective(trial):
             else:
                 break
 
-    for stage_idx, predict_len in enumerate(STAGE_LENGTHS):
+    for stage_idx, curr_len in enumerate(STAGE_LENGTHS):
         if stage_idx > 0:
             (
                 train_loader,
@@ -94,27 +94,48 @@ def objective(trial):
                 submission_to_date_map,
                 test_indices,
                 item_weights,
-            ) = prepare_datasets(SEQUENCE_LENGTH, predict_len, BATCH_SIZE)
+            ) = prepare_datasets(SEQUENCE_LENGTH, curr_len, BATCH_SIZE)
 
-        for _ in range(epochs_per_stage[stage_idx]):
+        for epoch in range(epochs_per_stage[stage_idx]):
+            update_sampling_prob(epoch)
             model.train()
-            for inputs, labels, _ in train_loader:
+            for inputs, labels, batch_item_ids in train_loader:
                 inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
+                weights = (
+                    torch.tensor([item_weights[item] for item in batch_item_ids], dtype=torch.float32)
+                    .unsqueeze(1)
+                    .to(DEVICE)
+                )
                 optimizer.zero_grad()
-                outputs = model(inputs)[:, :predict_len]
-                loss = criterion(outputs, labels) + smape_loss_fn(outputs, labels)
+                outputs = model(inputs, curr_len, labels, SCHEDULED_SAMPLING_PROB)
+                loss = (
+                    criterion(outputs, labels) * weights
+                    + smape_loss_fn(outputs, labels, weights)
+                ).mean()
                 loss.backward()
                 optimizer.step()
 
     model.eval()
-    all_preds, all_labels, all_item_ids = [], [], []
+    val_loss, all_preds, all_labels, all_item_ids = 0, [], [], []
     with torch.no_grad():
         for inputs, labels, batch_item_ids in val_loader:
             inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
-            outputs = model(inputs)[:, :STAGE_LENGTHS[-1]]
+            weights = (
+                torch.tensor([item_weights[item] for item in batch_item_ids], dtype=torch.float32)
+                .unsqueeze(1)
+                .to(DEVICE)
+            )
+            outputs = model(inputs, STAGE_LENGTHS[-1])
+            batch_loss = (
+                criterion(outputs, labels) * weights
+                + smape_loss_fn(outputs, labels, weights)
+            ).mean()
+            val_loss += batch_loss.item()
             all_preds.append(outputs.cpu().numpy())
             all_labels.append(labels.cpu().numpy())
             all_item_ids.append(np.repeat(batch_item_ids, STAGE_LENGTHS[-1]))
+
+    val_loss /= len(val_loader)
 
     all_preds = np.concatenate(all_preds, axis=0)
     all_labels = np.concatenate(all_labels, axis=0)
