@@ -181,13 +181,18 @@ def main():
         for param_group in optimizer.param_groups:
             param_group["lr"] = LEARNING_RATE / 25
         warmup_epochs = min(2, epochs)
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer,
-            max_lr=LEARNING_RATE,
-            epochs=epochs,
-            steps_per_epoch=len(train_loader),
-            pct_start=warmup_epochs / epochs,
-            div_factor=25,
+        pct_start = warmup_epochs / epochs if epochs > 1 else 0.5  # 0.5 등 1 미만 값
+        scheduler = (
+            torch.optim.lr_scheduler.OneCycleLR(
+                optimizer,
+                max_lr=LEARNING_RATE,
+                epochs=epochs,
+                steps_per_epoch=len(train_loader),
+                pct_start=pct_start,
+                div_factor=25,
+            )
+            if epochs > 1
+            else None
         )
         logging.info(
             "Starting curriculum stage %s with predict_length=%s for %s epochs",
@@ -242,7 +247,8 @@ def main():
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
-                scheduler.step()
+                if scheduler:
+                    scheduler.step()
 
             model.eval()
             val_loss, all_preds, all_labels, all_item_ids = 0, [], [], []
