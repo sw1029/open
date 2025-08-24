@@ -303,20 +303,23 @@ val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
 # --- 4. LSTM 모델 정의 ---
 print("Step 4: Defining LSTM model...")
-class LSTMModel(nn.Module):
+class LSTMAttention(nn.Module):
     def __init__(self, input_size, hidden_size, num_layers, output_size):
-        super(LSTMModel, self).__init__()
+        super(LSTMAttention, self).__init__()
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=0.2)
+        self.attn_score = nn.Linear(hidden_size, 1)
         self.fc = nn.Linear(hidden_size, output_size)
         self.activation = nn.LeakyReLU()
 
     def forward(self, x):
-        out, _ = self.lstm(x)
-        out = self.fc(out[:, -1, :])
+        lstm_out, _ = self.lstm(x)
+        attn_weights = torch.softmax(self.attn_score(lstm_out), dim=1)
+        context = (lstm_out * attn_weights).sum(dim=1)
+        out = self.fc(context)
         out = self.activation(out)
         return out
 
-model = LSTMModel(input_size=len(features), hidden_size=HIDDEN_SIZE, num_layers=NUM_LAYERS, output_size=PREDICT_LENGTH).to(DEVICE)
+model = LSTMAttention(input_size=len(features), hidden_size=HIDDEN_SIZE, num_layers=NUM_LAYERS, output_size=PREDICT_LENGTH).to(DEVICE)
 criterion = nn.SmoothL1Loss()
 smape_loss_fn = SMAPELoss()
 optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
@@ -556,5 +559,5 @@ final_submission[value_columns] = final_submission[value_columns].fillna(0)
 # 제출 직전에만 반올림하여 정수로 변환
 final_submission[value_columns] = np.round(final_submission[value_columns]).astype(int)
 
-final_submission.to_csv("result.csv", index=False)
-print("Submission file created successfully at: lstm_submission_recursive_full.csv")
+final_submission.to_csv("lstm_attention_submission.csv", index=False)
+print("Submission file created successfully at: lstm_attention_submission.csv")
