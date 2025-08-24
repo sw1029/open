@@ -24,13 +24,17 @@ HIDDEN_SIZE = 128 # 모델 용량 증가
 NUM_LAYERS = 2
 PATIENCE = 10 # 조기 종료를 위한 patience
 
-def smape(y_true, y_pred):
+def smape(y_true, y_pred, eps: float = 1e-8):
+    """Symmetric mean absolute percentage error.
+
+    Adds a small ``eps`` to the denominator to avoid ``0/0`` situations that
+    can produce ``nan`` values during evaluation.
+    """
     y_true = np.array(y_true)
     y_pred = np.array(y_pred)
     numerator = np.abs(y_pred - y_true)
-    denominator = (np.abs(y_true) + np.abs(y_pred)) / 2
-    ratio = np.where(denominator == 0, 0, numerator / denominator)
-    return np.mean(ratio) * 100
+    denominator = (np.abs(y_true) + np.abs(y_pred)) / 2 + eps
+    return np.mean(numerator / denominator) * 100
 
 
 class SMAPELoss(nn.Module):
@@ -46,8 +50,8 @@ class SMAPELoss(nn.Module):
 
     def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         numerator = torch.abs(y_pred - y_true)
-        denominator = torch.abs(y_true) + torch.abs(y_pred) + self.eps
-        return (2.0 * numerator / denominator).mean()
+        denominator = (torch.abs(y_true) + torch.abs(y_pred)) / 2 + self.eps
+        return (numerator / denominator).mean()
 
 def get_future_date_str(date_str, days_to_add):
     """ 'TEST_00+1일' 형식의 문자열 날짜를 days_to_add 만큼 더한 문자열을 반환 """
