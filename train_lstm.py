@@ -457,13 +457,16 @@ final_submission = sample_submission_df[['영업일자']].merge(
     submission_df, on='영업일자', how='left'
 )
 
-# 결측치 확인 및 필요한 경우에만 0으로 대체
+# 결측치 확인: 존재하면 상세 정보 출력 후 실행 중단
 na_counts = final_submission.isna().sum()
 if na_counts.sum() > 0:
     print("Missing values detected in final submission columns:")
     print(na_counts[na_counts > 0])
-    cols_to_fill = [col for col in final_submission.columns if col != '영업일자' and na_counts[col] > 0]
-    final_submission[cols_to_fill] = final_submission[cols_to_fill].fillna(0)
+    for col in final_submission.columns:
+        if col != '영업일자' and na_counts[col] > 0:
+            missing_dates = final_submission.loc[final_submission[col].isna(), '영업일자']
+            print(f"Column '{col}' has missing dates: {missing_dates.tolist()}")
+    raise ValueError("NaNs found in final submission. Aborting.")
 
 final_submission = final_submission[sample_submission_df.columns]
 
