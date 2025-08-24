@@ -19,6 +19,9 @@ BATCH_SIZE = 64
 OPTUNA_EPOCHS = 10
 RETRAIN_EPOCHS = 30
 
+# Track the best SMAPE observed during Optuna trials
+best_smape = float("inf")
+
 (
     train_loader,
     val_loader,
@@ -34,6 +37,7 @@ RETRAIN_EPOCHS = 30
 
 
 def objective(trial):
+    global best_smape
     hidden_size = trial.suggest_int("hidden_size", 64, 256)
     num_layers = trial.suggest_int("num_layers", 1, 3)
     lr = trial.suggest_float("lr", 1e-4, 1e-2, log=True)
@@ -93,19 +97,29 @@ def objective(trial):
             all_preds_unscaled[i][all_preds_unscaled[i] < 0] = 0
             all_labels_unscaled[i][all_labels_unscaled[i] < 0] = 0
 
-    return smape(all_labels_unscaled, all_preds_unscaled)
+    smape_value = smape(all_labels_unscaled, all_preds_unscaled)
+    if smape_value < best_smape:
+        best_smape = smape_value
+        model_path = f"best_model_trial_{trial.number}.pth"
+        torch.save(model.state_dict(), model_path)
+        trial.set_user_attr("best_model_path", model_path)
+    return smape_value
 
 
 study = optuna.create_study(direction="minimize")
 study.optimize(objective, n_trials=5)
 
-best_params = study.best_trial.params
+best_trial = study.best_trial
+best_params = best_trial.params
 best_model = LSTMAttention(
     input_size=len(features),
     hidden_size=best_params["hidden_size"],
     num_layers=best_params["num_layers"],
     output_size=PREDICT_LENGTH,
 ).to(DEVICE)
+best_model_path = best_trial.user_attrs.get("best_model_path")
+if best_model_path:
+    best_model.load_state_dict(torch.load(best_model_path))
 criterion = nn.SmoothL1Loss()
 smape_loss_fn = SMAPELoss()
 optimizer = torch.optim.Adam(best_model.parameters(), lr=best_params["lr"])
@@ -119,6 +133,8 @@ for epoch in tqdm(range(RETRAIN_EPOCHS), desc="Training best model"):
         loss = criterion(outputs, labels) + smape_loss_fn(outputs, labels)
         loss.backward()
         optimizer.step()
+
+torch.save(best_model.state_dict(), "best_model.pth")
 
 predict_and_submit(
     best_model,
