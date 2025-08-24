@@ -178,6 +178,7 @@ def load_calendar_features(df, event_path='events.csv'):
     df['season'] = df['month'].apply(month_to_season)
     return df
 
+
 # train_df와 test_df에 각각 다른 피처 엔지니어링 함수 적용
 train_df = create_features_train(train_df)
 test_df = create_features_test(test_df)
@@ -185,11 +186,69 @@ test_df = create_features_test(test_df)
 train_df = load_calendar_features(train_df)
 test_df = load_calendar_features(test_df)
 
-# 이후 처리를 위해 test_df의 '영업일자'를 문자열로 명시적 변환
+# 라벨 인코딩 (train/test 분리 상태에서 일관성 있게 적용)
+for col in ['영업장명', '메뉴명']:
+    le = LabelEncoder()
+    le.fit(pd.concat([train_df[col], test_df[col]]))
+    train_df[col + '_encoded'] = le.transform(train_df[col])
+    test_df[col + '_encoded'] = le.transform(test_df[col])
+print(f"DEBUG after label_encoding: train NaNs {train_df['매출수량'].isna().sum()}, test NaNs {test_df['매출수량'].isna().sum()}")
+
+# 시차 피처 생성
+lags = [1, 7, 14, 28]
+train_df = train_df.sort_values(by=['영업장명_메뉴명', '영업일자'])
+for lag in lags:
+    train_df[f'lag_{lag}'] = train_df.groupby('영업장명_메뉴명')['매출수량'].shift(lag)
+
+test_df = test_df.sort_values(by=['test_id', '영업장명_메뉴명', '영업일자'])
+for lag in lags:
+    test_df[f'lag_{lag}'] = test_df.groupby(['test_id', '영업장명_메뉴명'])['매출수량'].shift(lag)
+print(f"DEBUG after lag_creation: train NaNs {train_df['매출수량'].isna().sum()}, test NaNs {test_df['매출수량'].isna().sum()}")
+
+# 상관관계 기반 best buddy 피처 생성
+corr_files = glob.glob('data/*.csv')
+corr_matrices = {os.path.basename(f).replace('.csv', ''): pd.read_csv(f, index_col=0) for f in corr_files}
+best_buddy_map = {
+    (store, menu): corr_matrix[menu].drop(menu).idxmax()
+    for store, corr_matrix in corr_matrices.items()
+    for menu in corr_matrix.columns
+}
+train_df['best_buddy'] = train_df.set_index(['영업장명', '메뉴명']).index.map(best_buddy_map.get)
+test_df['best_buddy'] = test_df.set_index(['영업장명', '메뉴명']).index.map(best_buddy_map.get)
+
+# buddy_lag_1_sales 생성
+lag1_train = train_df[['영업일자', '영업장명', '메뉴명', 'lag_1']].rename(columns={'lag_1': 'buddy_lag_1_sales'})
+train_df = pd.merge(
+    train_df,
+    lag1_train,
+    left_on=['영업일자', '영업장명', 'best_buddy'],
+    right_on=['영업일자', '영업장명', '메뉴명'],
+    how='left',
+    suffixes=('', '_buddy')
+)
+train_df.drop(columns=['메뉴명_buddy'], inplace=True)
+
+lag1_test = test_df[['test_id', '영업일자', '영업장명', '메뉴명', 'lag_1']].rename(columns={'lag_1': 'buddy_lag_1_sales'})
+test_df = pd.merge(
+    test_df,
+    lag1_test,
+    left_on=['test_id', '영업일자', '영업장명', 'best_buddy'],
+    right_on=['test_id', '영업일자', '영업장명', '메뉴명'],
+    how='left',
+    suffixes=('', '_buddy')
+)
+test_df.drop(columns=['메뉴명_buddy'], inplace=True)
+
+# 피처 생성 과정에서 생긴 NaN만 0으로 채움 (예측 대상인 매출수량의 NaN은 유지)
+cols_to_fill = [f'lag_{lag}' for lag in lags] + ['buddy_lag_1_sales']
+train_df[cols_to_fill] = train_df[cols_to_fill].fillna(0)
+test_df[cols_to_fill] = test_df[cols_to_fill].fillna(0)
+
+# 이후 처리를 위해 '영업일자'를 문자열로 변환
 train_df['영업일자'] = train_df['영업일자'].astype(str)
 test_df['영업일자'] = test_df['영업일자'].astype(str)
 
-
+# train/test 합쳐 결측치 검증
 train_df['source'] = 'train'
 test_df['source'] = 'test'
 combined_df = pd.concat([train_df, test_df], ignore_index=True)
@@ -199,42 +258,9 @@ if combined_nan_count != expected_test_nans:
     raise ValueError(
         f"Combined dataframe has {combined_nan_count} NaNs, expected {expected_test_nans}"
     )
-
-for col in ['영업장명', '메뉴명']:
-    le = LabelEncoder()
-    combined_df[col+'_encoded'] = le.fit_transform(combined_df[col])
-print(f"DEBUG after label_encoding: NaNs count = {combined_df['매출수량'].isna().sum()}")
-
-combined_df = combined_df.sort_values(by=['영업장명_메뉴명', '영업일자'])
-print(f"DEBUG after sort_values: NaNs count = {combined_df['매출수량'].isna().sum()}")
-
-lags = [1, 7, 14]
-for lag in lags:
-    combined_df[f'lag_{lag}'] = combined_df.groupby('영업장명_메뉴명')['매출수량'].shift(lag)
-print(f"DEBUG after lag_creation: NaNs count = {combined_df['매출수량'].isna().sum()}")
-
-corr_files = glob.glob('data/*.csv')
-corr_matrices = {os.path.basename(f).replace('.csv', ''): pd.read_csv(f, index_col=0) for f in corr_files}
-best_buddy_map = { (store, menu): corr_matrix[menu].drop(menu).idxmax() for store, corr_matrix in corr_matrices.items() for menu in corr_matrix.columns }
-combined_df['best_buddy'] = combined_df.set_index(['영업장명', '메뉴명']).index.map(best_buddy_map.get)
-print(f"DEBUG after best_buddy: NaNs count = {combined_df['매출수량'].isna().sum()}")
-
-lag1_sales_df = combined_df[['영업일자', '영업장명', '메뉴명', 'lag_1']].rename(columns={'lag_1': 'buddy_lag_1_sales'})
-combined_df = pd.merge(combined_df, lag1_sales_df, left_on=['영업일자', '영업장명', 'best_buddy'], right_on=['영업일자', '영업장명', '메뉴명'], how='left', suffixes=('', '_buddy'))
-print(f"DEBUG after merge: NaNs count = {combined_df['매출수량'].isna().sum()}")
-
-# 피처 생성 과정에서 생긴 NaN만 0으로 채움 (예측 대상인 매출수량의 NaN은 유지)
-cols_to_fill = [f'lag_{lag}' for lag in lags] + ['buddy_lag_1_sales']
-for col in cols_to_fill:
-    # 경고를 해결하고 더 안전한 방식으로 NaN 값을 채움
-    combined_df[col] = combined_df[col].fillna(0)
-
-# 수정이 잘 적용되었는지 확인하기 위한 디버그 코드
-print(f"DEBUG after targeted fillna: NaNs count = {combined_df['매출수량'].isna().sum()}")
-
 # --- 2. 데이터 전처리 ---
 print("Step 2: Scaling and creating sequences...")
-features_to_scale = ['dayofweek', 'month', '영업장명_encoded', '메뉴명_encoded', 'lag_1', 'lag_7', 'lag_14', 'buddy_lag_1_sales', 'is_holiday', 'season', 'is_event']
+features_to_scale = ['dayofweek', 'month', '영업장명_encoded', '메뉴명_encoded', 'lag_1', 'lag_7', 'lag_14', 'lag_28', 'buddy_lag_1_sales', 'is_holiday', 'season', 'is_event']
 target_col = '매출수량'
 
 # 로그 변환 적용 (매출수량이 NaN이 아닌 경우에만)
