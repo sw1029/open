@@ -119,9 +119,8 @@ def main():
     ).to(DEVICE)
     criterion = nn.SmoothL1Loss(reduction="none")
     smape_loss_fn = SMAPELoss(reduction="none")
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, "min", patience=5, factor=0.5, verbose=True
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=LEARNING_RATE, weight_decay=1e-5
     )
 
     best_val_smape = float("inf")
@@ -146,6 +145,17 @@ def main():
                 test_indices,
                 item_weights,
             ) = prepare_datasets(SEQUENCE_LENGTH, curr_len, BATCH_SIZE)
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = LEARNING_RATE / 25
+        warmup_epochs = min(2, epochs)
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=LEARNING_RATE,
+            epochs=epochs,
+            steps_per_epoch=len(train_loader),
+            pct_start=warmup_epochs / epochs,
+            div_factor=25,
+        )
         logging.info(
             "Starting curriculum stage %s with predict_length=%s for %s epochs",
             stage_idx,
@@ -184,7 +194,9 @@ def main():
                 smape_loss = smape_loss_fn(outputs, labels, weights, time_weights).mean()
                 loss = alpha * l1_loss + (1 - alpha) * smape_loss
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
+                scheduler.step()
 
             model.eval()
             val_loss, all_preds, all_labels, all_item_ids = 0, [], [], []
@@ -211,7 +223,6 @@ def main():
                     all_item_ids.append(np.repeat(batch_item_ids, curr_len))
 
             val_loss /= len(val_loader)
-            scheduler.step(val_loss)
             
             all_preds = np.concatenate(all_preds, axis=0)
             all_labels = np.concatenate(all_labels, axis=0)
