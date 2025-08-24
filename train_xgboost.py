@@ -88,32 +88,45 @@ combined_df = pd.merge(
 )
 
 combined_df.drop(columns=['메뉴명_buddy', 'best_buddy'], inplace=True)
-combined_df.fillna(0, inplace=True)
+
 
 # --- 3. 모델 훈련 및 검증 ---
 print("Step 3: Training and validating XGBoost model...")
 
-# 학습 데이터와 테스트 데이터 다시 분리
+# 학습 데이터와 테스트 데이터 다시 분리 (기존 코드와 동일)
 train_df = combined_df[combined_df['매출수량'].notna()]
-test_df = combined_df[combined_df['매출수량'].isna()]
+test_df = combined_df[combined_df['매출수량'].isna()].copy() # .copy() 추가
 
 features = [
     'year', 'month', 'day', 'dayofweek', 'weekofyear',
     '영업장명_encoded', '메뉴명_encoded',
     'lag_1', 'lag_7', 'lag_14', 'lag_28',
     'rolling_mean_7',
-    'buddy_lag_1_sales' # 새로운 피처 추가
+    'buddy_lag_1_sales'
 ]
 target = '매출수량'
 
+# train_df 내에서 검증 데이터 분리 (기존 코드와 동일)
 cutoff_date = train_df['영업일자'].max() - pd.Timedelta(days=7)
 train_split_df = train_df[train_df['영업일자'] <= cutoff_date]
 val_split_df = train_df[train_df['영업일자'] > cutoff_date]
 
 X_train, y_train = train_split_df[features], train_split_df[target]
 X_val, y_val = val_split_df[features], val_split_df[target]
+X_test = test_df[features]
+
+# 데이터 분리 후, 각 피처 셋에 대해 결측치 처리
+X_train.fillna(0, inplace=True)
+X_val.fillna(0, inplace=True)
+X_test.fillna(0, inplace=True)
+
+print(f"Training data size: {len(X_train)}, Validation data size: {len(X_val)}, Test data size: {len(X_test)}")
 
 print(f"Training data size: {len(X_train)}, Validation data size: {len(X_val)}")
+
+# y_train에 로그 변환 적용
+y_train_log = np.log1p(np.maximum(0, y_train))
+y_val_log = np.log1p(np.maximum(0, y_val))
 
 xgb_reg = xgb.XGBRegressor(
     n_estimators=1000,
@@ -126,16 +139,20 @@ xgb_reg = xgb.XGBRegressor(
     early_stopping_rounds=50
 )
 
-xgb_reg.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=100)
+xgb_reg.fit(X_train, y_train_log, eval_set=[(X_val, y_val_log)], verbose=100) # y_train_log, y_val_log 사용
 
-val_preds = xgb_reg.predict(X_val)
+val_preds_log = xgb_reg.predict(X_val)
+val_preds = np.expm1(val_preds_log) # expm1로 역변환
 val_preds[val_preds < 0] = 0
-smape_score = smape(y_val, val_preds)
+smape_score = smape(y_val, val_preds) # 원본 y_val과 비교
 print(f"\nValidation SMAPE Score with Corr-Feature: {smape_score:.4f}\n")
 
 # --- 4. 전체 데이터로 재학습 및 최종 예측 ---
 print("Step 4: Retraining on full data and creating submission file...")
 X_train_full, y_train_full = train_df[features], train_df[target]
+
+# 최종 예측 시에도 동일하게 적용
+y_train_full_log = np.log1p(np.maximum(0, y_train_full)) # 로그 변환 및 음수 값 클리핑
 
 final_params = xgb_reg.get_params()
 final_params['n_estimators'] = xgb_reg.best_iteration
@@ -143,12 +160,14 @@ if 'early_stopping_rounds' in final_params:
     del final_params['early_stopping_rounds']
 
 xgb_reg_final = xgb.XGBRegressor(**final_params)
-xgb_reg_final.fit(X_train_full, y_train_full, verbose=False)
+xgb_reg_final.fit(X_train_full, y_train_full_log, verbose=False) # y_train_full_log 사용
 
 X_test = test_df[features]
-predictions = xgb_reg_final.predict(X_test)
+predictions_log = xgb_reg_final.predict(X_test)
+predictions = np.expm1(predictions_log) # 역변환
 predictions[predictions < 0] = 0
 test_df.loc[:, '매출수량'] = predictions.astype(int)
+
 
 submission_df = test_df.pivot_table(index='영업일자', columns='영업장명_메뉴명', values='매출수량').reset_index()
 submission_df = submission_df.reindex(columns=sample_submission_df.columns)

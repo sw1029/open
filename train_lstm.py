@@ -115,41 +115,60 @@ print("Step 2: Scaling and creating sequences...")
 features_to_scale = ['dayofweek', 'month', '영업장명_encoded', '메뉴명_encoded', 'lag_1', 'lag_7', 'lag_14', 'buddy_lag_1_sales']
 target_col = '매출수량'
 
+# 로그 변환 적용 (매출수량이 NaN이 아닌 경우에만)
+combined_df.loc[combined_df[target_col].notna(), target_col] = combined_df.loc[combined_df[target_col].notna(), target_col].apply(lambda x: np.log1p(x) if x > 0 else 0)
+
 scaler = MinMaxScaler()
 combined_df[features_to_scale] = scaler.fit_transform(combined_df[features_to_scale])
-target_scaler = MinMaxScaler()
-combined_df[target_col] = combined_df[target_col].astype(float)
-combined_df.loc[combined_df[target_col].notna(), target_col] = target_scaler.fit_transform(combined_df.loc[combined_df[target_col].notna(), [target_col]])
+
+scalers = {}
+for item_id in tqdm(combined_df['영업장명_메뉴명'].unique(), desc="Scaling target by item"):
+    scaler = MinMaxScaler()
+    item_sales = combined_df.loc[combined_df['영업장명_메뉴명'] == item_id, target_col].values.reshape(-1, 1)
+    
+    # 학습 데이터에만 fit_transform 적용 (NaN이 아닌 값만 사용)
+    train_sales = item_sales[~np.isnan(item_sales).squeeze()]
+    if len(train_sales) > 0:
+        scaler.fit(train_sales.reshape(-1, 1))
+        
+        # 전체 데이터에 transform 적용 (NaN 포함)
+        combined_df.loc[combined_df['영업장명_메뉴명'] == item_id, target_col] = scaler.transform(item_sales).flatten()
+        scalers[item_id] = scaler
 
 def create_sequences(data, features, target, seq_length):
-    xs, ys = [], []
-    for _, group in data.groupby('영업장명_메뉴명'):
+    xs, ys, item_ids = [], [], []
+    for item_id, group in data.groupby('영업장명_메뉴명'):
         feature_data = group[features].values
         target_data = group[target].values
         for i in range(len(group) - seq_length):
             xs.append(feature_data[i:i+seq_length])
             ys.append(target_data[i+seq_length])
-    return np.array(xs), np.array(ys)
+            item_ids.append(item_id)
+    return np.array(xs), np.array(ys), np.array(item_ids)
 
 features = features_to_scale
 train_data = combined_df[combined_df['매출수량'].notna()]
-X, y = create_sequences(train_data, features, [target_col], SEQUENCE_LENGTH)
+X, y, item_ids = create_sequences(train_data, features, [target_col], SEQUENCE_LENGTH)
 
-X_train, X_val, y_train, y_val = X[:int(len(X)*0.9)], X[int(len(X)*0.9):], y[:int(len(y)*0.9)], y[int(len(y)*0.9):]
+X_train, X_val, y_train, y_val, item_ids_train, item_ids_val = \
+    X[:int(len(X)*0.9)], X[int(len(X)*0.9):], \
+    y[:int(len(y)*0.9)], y[int(len(y)*0.9):], \
+    item_ids[:int(len(item_ids)*0.9)], item_ids[int(len(item_ids)*0.9):]
 
 # --- 3. PyTorch Dataset 및 DataLoader ---
 print("Step 3: Creating PyTorch Datasets and Dataloaders...")
 class SalesDataset(Dataset):
-    def __init__(self, X, y):
+    def __init__(self, X, y, item_ids):
         self.X = torch.tensor(X, dtype=torch.float32)
         self.y = torch.tensor(y, dtype=torch.float32)
+        self.item_ids = item_ids
     def __len__(self):
         return len(self.X)
     def __getitem__(self, idx):
-        return self.X[idx], self.y[idx]
+        return self.X[idx], self.y[idx], self.item_ids[idx]
 
-train_dataset = SalesDataset(X_train, y_train)
-val_dataset = SalesDataset(X_val, y_val)
+train_dataset = SalesDataset(X_train, y_train, item_ids_train)
+val_dataset = SalesDataset(X_val, y_val, item_ids_val)
 train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
 val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
@@ -178,7 +197,7 @@ patience_counter = 0
 epoch_iterator = tqdm(range(NUM_EPOCHS), desc="Training Epochs")
 for epoch in epoch_iterator:
     model.train()
-    for inputs, labels in train_loader:
+    for inputs, labels, _ in train_loader:
         inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
         optimizer.zero_grad()
         outputs = model(inputs)
@@ -187,22 +206,51 @@ for epoch in epoch_iterator:
         optimizer.step()
 
     model.eval()
-    val_loss, all_preds, all_labels = 0, [], []
+    val_loss, all_preds, all_labels, all_item_ids = 0, [], [], []
     with torch.no_grad():
-        for inputs, labels in val_loader:
+        for inputs, labels, batch_item_ids in val_loader:
             inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
             outputs = model(inputs)
             val_loss += criterion(outputs, labels).item()
             all_preds.append(outputs.cpu().numpy())
             all_labels.append(labels.cpu().numpy())
+            all_item_ids.append(batch_item_ids)
     
     val_loss /= len(val_loader)
     scheduler.step(val_loss) # 스케줄러 step
 
     all_preds = np.concatenate(all_preds)
     all_labels = np.concatenate(all_labels)
-    all_preds_unscaled = target_scaler.inverse_transform(all_preds)
-    all_labels_unscaled = target_scaler.inverse_transform(all_labels)
+    all_item_ids = np.concatenate(all_item_ids)
+
+    # 역변환 로직
+    all_preds_unscaled = np.zeros_like(all_preds)
+    all_labels_unscaled = np.zeros_like(all_labels)
+
+    for i in range(len(all_preds)):
+        item_id = all_item_ids[i]
+        if item_id in scalers:
+            # 스케일러 역변환
+            pred_unscaled = scalers[item_id].inverse_transform(all_preds[i].reshape(-1, 1))
+            label_unscaled = scalers[item_id].inverse_transform(all_labels[i].reshape(-1, 1))
+            
+            # 로그 변환 역변환
+            pred_original = np.expm1(pred_unscaled)
+            label_original = np.expm1(label_unscaled)
+            
+            # 음수 값은 0으로 처리
+            pred_original[pred_original < 0] = 0
+            label_original[label_original < 0] = 0
+            
+            all_preds_unscaled[i] = pred_original
+            all_labels_unscaled[i] = label_original
+        else:
+            # 스케일러가 없는 경우 (예외 처리 또는 0으로 처리)
+            # 이 경우는 발생하지 않아야 하지만, 안전을 위해 로그 역변환만 수행
+            all_preds_unscaled[i] = np.expm1(all_preds[i]) 
+            all_labels_unscaled[i] = np.expm1(all_labels[i])
+            all_preds_unscaled[i][all_preds_unscaled[i] < 0] = 0
+            all_labels_unscaled[i][all_labels_unscaled[i] < 0] = 0
     val_smape = smape(all_labels_unscaled, all_preds_unscaled)
 
     epoch_iterator.set_postfix(val_loss=f"{val_loss:.6f}", val_smape=f"{val_smape:.4f}")
@@ -292,9 +340,33 @@ with torch.no_grad():
 
 # --- 4. 최종 결과 처리 ---
 # 예측된 값들의 스케일을 원래대로 복원
-predicted_values_scaled = recursive_df.loc[test_indices, '매출수량'].values.reshape(-1, 1)
-predicted_values_unscaled = target_scaler.inverse_transform(predicted_values_scaled)
-recursive_df.loc[test_indices, '매출수량'] = predicted_values_unscaled.flatten()
+# target_scaler 대신 scalers 딕셔너리를 사용하여 품목별 역변환 수행
+# recursive_df.loc[test_indices, '매출수량'] = predicted_values_unscaled.flatten() # 이 라인은 아래 for 루프에서 처리됨
+
+# submission_df를 recursive_df.loc[test_indices]로 초기화하여 사용
+submission_df_for_inverse = recursive_df.loc[test_indices].copy()
+
+for item_id in tqdm(submission_df_for_inverse['영업장명_메뉴명'].unique(), desc="Inverse transforming predictions"):
+    if item_id in scalers:
+        item_indices = submission_df_for_inverse[submission_df_for_inverse['영업장명_메뉴명'] == item_id].index
+        predicted_values_scaled = submission_df_for_inverse.loc[item_indices, '매출수량'].values.reshape(-1, 1)
+        
+        # 스케일러 역변환
+        predicted_values_unscaled = scalers[item_id].inverse_transform(predicted_values_scaled)
+        
+        # 로그 변환 역변환
+        predicted_values_original = np.expm1(predicted_values_unscaled)
+        
+        # 음수 값은 0으로 처리
+        predicted_values_original[predicted_values_original < 0] = 0
+        
+        submission_df_for_inverse.loc[item_indices, '매출수량'] = predicted_values_original.flatten()
+
+# 최종적으로 recursive_df에 역변환된 값을 반영
+recursive_df.loc[test_indices, '매출수량'] = submission_df_for_inverse['매출수량']
+
+# 반올림하여 정수로 변환
+recursive_df.loc[test_indices, '매출수량'] = np.round(recursive_df.loc[test_indices, '매출수량']).astype(int)
 
 # --- 5. 제출 파일 생성 ---
 submission_df = recursive_df.loc[test_indices].pivot_table(index='영업일자', columns='영업장명_메뉴명', values='매출수량').reset_index()
