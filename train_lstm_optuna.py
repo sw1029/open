@@ -19,22 +19,12 @@ BATCH_SIZE = 64
 OPTUNA_EPOCHS = 10
 RETRAIN_EPOCHS = 30
 
+# Progressive training lengths and their epoch ratios
+STAGE_LENGTHS = [1, 3, PREDICT_LENGTH]
+STAGE_RATIOS = [1, 1, 1]
+
 # Track the best SMAPE observed during Optuna trials
 best_smape = float("inf")
-
-(
-    train_loader,
-    val_loader,
-    scalers,
-    combined_df,
-    features,
-    target_col,
-    sample_submission_df,
-    submission_date_map,
-    submission_to_date_map,
-    test_indices,
-    item_weights,
-) = prepare_datasets(SEQUENCE_LENGTH, PREDICT_LENGTH, BATCH_SIZE)
 
 
 def objective(trial):
@@ -44,6 +34,21 @@ def objective(trial):
     lr = trial.suggest_float("lr", 1e-4, 1e-2, log=True)
     num_heads = trial.suggest_int("num_heads", 1, 8)
     decoder_steps = trial.suggest_int("decoder_steps", PREDICT_LENGTH, 14)
+
+    # Prepare datasets for the first stage to obtain feature information
+    (
+        train_loader,
+        val_loader,
+        scalers,
+        combined_df,
+        features,
+        target_col,
+        sample_submission_df,
+        submission_date_map,
+        submission_to_date_map,
+        test_indices,
+        item_weights,
+    ) = prepare_datasets(SEQUENCE_LENGTH, STAGE_LENGTHS[0], BATCH_SIZE)
 
     model = Seq2Seq(
         input_size=len(features),
@@ -57,25 +62,50 @@ def objective(trial):
     smape_loss_fn = SMAPELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
-    for _ in range(OPTUNA_EPOCHS):
-        model.train()
-        for inputs, labels, _ in train_loader:
-            inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
-            optimizer.zero_grad()
-            outputs = model(inputs)[:, :PREDICT_LENGTH]
-            loss = criterion(outputs, labels) + smape_loss_fn(outputs, labels)
-            loss.backward()
-            optimizer.step()
+    total_ratio = sum(STAGE_RATIOS)
+    epochs_per_stage = [max(1, OPTUNA_EPOCHS * r // total_ratio) for r in STAGE_RATIOS]
+    while sum(epochs_per_stage) < OPTUNA_EPOCHS:
+        for i in range(len(epochs_per_stage)):
+            if sum(epochs_per_stage) < OPTUNA_EPOCHS:
+                epochs_per_stage[i] += 1
+            else:
+                break
+
+    for stage_idx, predict_len in enumerate(STAGE_LENGTHS):
+        if stage_idx > 0:
+            (
+                train_loader,
+                val_loader,
+                scalers,
+                combined_df,
+                features,
+                target_col,
+                sample_submission_df,
+                submission_date_map,
+                submission_to_date_map,
+                test_indices,
+                item_weights,
+            ) = prepare_datasets(SEQUENCE_LENGTH, predict_len, BATCH_SIZE)
+
+        for _ in range(epochs_per_stage[stage_idx]):
+            model.train()
+            for inputs, labels, _ in train_loader:
+                inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
+                optimizer.zero_grad()
+                outputs = model(inputs)[:, :predict_len]
+                loss = criterion(outputs, labels) + smape_loss_fn(outputs, labels)
+                loss.backward()
+                optimizer.step()
 
     model.eval()
     all_preds, all_labels, all_item_ids = [], [], []
     with torch.no_grad():
         for inputs, labels, batch_item_ids in val_loader:
             inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
-            outputs = model(inputs)[:, :PREDICT_LENGTH]
+            outputs = model(inputs)[:, :STAGE_LENGTHS[-1]]
             all_preds.append(outputs.cpu().numpy())
             all_labels.append(labels.cpu().numpy())
-            all_item_ids.append(np.repeat(batch_item_ids, PREDICT_LENGTH))
+            all_item_ids.append(np.repeat(batch_item_ids, STAGE_LENGTHS[-1]))
 
     all_preds = np.concatenate(all_preds, axis=0)
     all_labels = np.concatenate(all_labels, axis=0)
@@ -116,6 +146,21 @@ study.optimize(objective, n_trials=50)
 
 best_trial = study.best_trial
 best_params = best_trial.params
+
+(
+    train_loader,
+    val_loader,
+    scalers,
+    combined_df,
+    features,
+    target_col,
+    sample_submission_df,
+    submission_date_map,
+    submission_to_date_map,
+    test_indices,
+    item_weights,
+) = prepare_datasets(SEQUENCE_LENGTH, PREDICT_LENGTH, BATCH_SIZE)
+
 best_model = Seq2Seq(
     input_size=len(features),
     hidden_size=best_params["hidden_size"],
