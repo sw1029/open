@@ -237,16 +237,45 @@ class Decoder(nn.Module):
         encoder_outputs: torch.Tensor,
         hidden,
         target_len: int | None = None,
+        targets: torch.Tensor | None = None,
+        scheduled_sampling_prob: float = 0.0,
     ):
+        """Decode with optional scheduled sampling.
+
+        During training, with probability ``scheduled_sampling_prob`` the model's
+        previous prediction is fed back as the next input instead of the ground
+        truth. This helps the model adapt to its own mistakes during inference.
+        """
         if target_len is None:
             target_len = self.decoder_steps
         batch_size = encoder_outputs.size(0)
-        decoder_input = torch.zeros(batch_size, target_len, 1, device=encoder_outputs.device)
-        decoder_outputs, hidden = self.lstm(decoder_input, hidden)
-        attn_output, _ = self.attn(decoder_outputs, encoder_outputs, encoder_outputs)
-        output = self.fc(attn_output)
-        output = self.activation(output)
-        return output.squeeze(-1)
+
+        decoder_input = torch.zeros(batch_size, 1, 1, device=encoder_outputs.device)
+        decoder_hidden = hidden
+        outputs = []
+        for t in range(target_len):
+            decoder_output, decoder_hidden = self.lstm(decoder_input, decoder_hidden)
+            attn_output, _ = self.attn(decoder_output, encoder_outputs, encoder_outputs)
+            step_output = self.fc(attn_output)
+            step_output = self.activation(step_output)
+            outputs.append(step_output)
+
+            if targets is not None and self.training:
+                teacher_input = targets[:, t].view(batch_size, 1, 1)
+                use_model_pred = (
+                    torch.rand(batch_size, 1, 1, device=encoder_outputs.device)
+                    < scheduled_sampling_prob
+                )
+                decoder_input = torch.where(
+                    use_model_pred,
+                    step_output.detach(),
+                    teacher_input,
+                )
+            else:
+                decoder_input = step_output.detach()
+
+        output = torch.cat(outputs, dim=1).squeeze(-1)
+        return output
 
 
 class Seq2Seq(nn.Module):
@@ -267,9 +296,21 @@ class Seq2Seq(nn.Module):
             hidden_size, num_layers, output_size, num_heads, decoder_steps
         )
 
-    def forward(self, x: torch.Tensor, target_len: int | None = None):
+    def forward(
+        self,
+        x: torch.Tensor,
+        target_len: int | None = None,
+        targets: torch.Tensor | None = None,
+        scheduled_sampling_prob: float = 0.0,
+    ):
         encoder_outputs, hidden = self.encoder(x)
-        outputs = self.decoder(encoder_outputs, hidden, target_len)
+        outputs = self.decoder(
+            encoder_outputs,
+            hidden,
+            target_len,
+            targets,
+            scheduled_sampling_prob,
+        )
         return outputs
 
 
