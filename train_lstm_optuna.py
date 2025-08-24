@@ -18,6 +18,15 @@ PREDICT_LENGTH = 7
 BATCH_SIZE = 64
 OPTUNA_EPOCHS = 10
 RETRAIN_EPOCHS = 30
+PATIENCE = 10
+
+SCHEDULED_SAMPLING_PROB = 0.1
+
+
+def update_sampling_prob(epoch: int) -> None:
+    """Linearly increase scheduled sampling probability with epoch."""
+    global SCHEDULED_SAMPLING_PROB
+    SCHEDULED_SAMPLING_PROB = min(0.5, 0.1 + 0.02 * epoch)
 
 # Progressive training lengths and their epoch ratios
 STAGE_LENGTHS = [1, 3, PREDICT_LENGTH]
@@ -166,28 +175,127 @@ best_model = Seq2Seq(
     hidden_size=best_params["hidden_size"],
     num_layers=best_params["num_layers"],
     num_heads=best_params["num_heads"],
-    decoder_steps=best_params["decoder_steps"],
+    decoder_steps=PREDICT_LENGTH,
     output_size=1,
 ).to(DEVICE)
 best_model_path = best_trial.user_attrs.get("best_model_path")
 if best_model_path:
     best_model.load_state_dict(torch.load(best_model_path))
-criterion = nn.SmoothL1Loss()
-smape_loss_fn = SMAPELoss()
+criterion = nn.SmoothL1Loss(reduction="none")
+smape_loss_fn = SMAPELoss(reduction="none")
 optimizer = torch.optim.Adam(best_model.parameters(), lr=best_params["lr"])
 
-for epoch in tqdm(range(RETRAIN_EPOCHS), desc="Training best model"):
+best_val_smape = float("inf")
+patience_counter = 0
+
+for epoch in tqdm(range(RETRAIN_EPOCHS), desc="Curriculum training"):
+    (
+        train_loader,
+        val_loader,
+        scalers,
+        combined_df,
+        features,
+        target_col,
+        sample_submission_df,
+        submission_date_map,
+        submission_to_date_map,
+        test_indices,
+        item_weights,
+    ) = prepare_datasets(SEQUENCE_LENGTH, PREDICT_LENGTH, BATCH_SIZE)
+
+    update_sampling_prob(epoch)
     best_model.train()
-    for inputs, labels, _ in train_loader:
+    for inputs, labels, batch_item_ids in train_loader:
         inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
+        weights = (
+            torch.tensor([item_weights[item] for item in batch_item_ids], dtype=torch.float32)
+            .unsqueeze(1)
+            .to(DEVICE)
+        )
         optimizer.zero_grad()
-        outputs = best_model(inputs)[:, :PREDICT_LENGTH]
-        loss = criterion(outputs, labels) + smape_loss_fn(outputs, labels)
+        outputs = best_model(inputs, PREDICT_LENGTH, labels, SCHEDULED_SAMPLING_PROB)
+        l1_loss = criterion(outputs, labels) * weights
+        smape_loss = smape_loss_fn(outputs, labels, weights)
+        loss = (l1_loss + smape_loss).mean()
         loss.backward()
         optimizer.step()
 
-torch.save(best_model.state_dict(), "best_model.pth")
+    best_model.eval()
+    val_loss, all_preds, all_labels, all_item_ids = 0, [], [], []
+    with torch.no_grad():
+        for inputs, labels, batch_item_ids in val_loader:
+            inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
+            weights = (
+                torch.tensor([item_weights[item] for item in batch_item_ids], dtype=torch.float32)
+                .unsqueeze(1)
+                .to(DEVICE)
+            )
+            outputs = best_model(inputs, PREDICT_LENGTH)
+            batch_loss = (
+                criterion(outputs, labels) * weights
+                + smape_loss_fn(outputs, labels, weights)
+            ).mean()
+            val_loss += batch_loss.item()
+            all_preds.append(outputs.cpu().numpy())
+            all_labels.append(labels.cpu().numpy())
+            all_item_ids.append(np.repeat(batch_item_ids, PREDICT_LENGTH))
 
+    val_loss /= len(val_loader)
+
+    all_preds = np.concatenate(all_preds, axis=0)
+    all_labels = np.concatenate(all_labels, axis=0)
+    all_item_ids = np.concatenate(all_item_ids, axis=0)
+
+    all_preds_flat = all_preds.reshape(-1, 1)
+    all_labels_flat = all_labels.reshape(-1, 1)
+    all_preds_unscaled = np.zeros_like(all_preds_flat)
+    all_labels_unscaled = np.zeros_like(all_labels_flat)
+
+    for i in range(len(all_preds_flat)):
+        item_id = all_item_ids[i]
+        if item_id in scalers:
+            pred_unscaled = scalers[item_id].inverse_transform(all_preds_flat[i].reshape(-1, 1))
+            label_unscaled = scalers[item_id].inverse_transform(all_labels_flat[i].reshape(-1, 1))
+            pred_original = np.expm1(pred_unscaled)
+            label_original = np.expm1(label_unscaled)
+            pred_original[pred_original < 0] = 0
+            label_original[label_original < 0] = 0
+            all_preds_unscaled[i] = pred_original
+            all_labels_unscaled[i] = label_original
+        else:
+            all_preds_unscaled[i] = np.expm1(all_preds_flat[i])
+            all_labels_unscaled[i] = np.expm1(all_labels_flat[i])
+            all_preds_unscaled[i][all_preds_unscaled[i] < 0] = 0
+            all_labels_unscaled[i][all_labels_unscaled[i] < 0] = 0
+
+    val_smape = smape(all_labels_unscaled, all_preds_unscaled)
+
+    if val_smape < best_val_smape:
+        best_val_smape = val_smape
+        patience_counter = 0
+        torch.save(best_model.state_dict(), "best_lstm_model.pth")
+    else:
+        patience_counter += 1
+        if patience_counter >= PATIENCE:
+            break
+
+
+(
+    _,
+    _,
+    scalers,
+    combined_df,
+    features,
+    target_col,
+    sample_submission_df,
+    submission_date_map,
+    submission_to_date_map,
+    test_indices,
+    _,
+) = prepare_datasets(SEQUENCE_LENGTH, PREDICT_LENGTH, BATCH_SIZE)
+
+best_model.load_state_dict(torch.load("best_lstm_model.pth"))
+final_predict_length = PREDICT_LENGTH
 predict_and_submit(
     best_model,
     combined_df,
@@ -199,5 +307,5 @@ predict_and_submit(
     submission_to_date_map,
     test_indices,
     SEQUENCE_LENGTH,
-    PREDICT_LENGTH,
+    final_predict_length,
 )
