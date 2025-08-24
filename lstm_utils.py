@@ -202,12 +202,20 @@ class Encoder(nn.Module):
     def __init__(self, input_size: int, hidden_size: int, num_layers: int):
         super().__init__()
         self.lstm = nn.LSTM(
-            input_size, hidden_size, num_layers, batch_first=True, dropout=0.2
+            input_size,
+            hidden_size,
+            num_layers,
+            batch_first=True,
+            dropout=0.2,
+            bidirectional=True,
         )
 
     def forward(self, x: torch.Tensor):
-        outputs, hidden = self.lstm(x)
-        return outputs, hidden
+        outputs, (h, c) = self.lstm(x)
+        # Combine forward and backward states for each layer
+        h = torch.cat((h[0::2], h[1::2]), dim=2)
+        c = torch.cat((c[0::2], c[1::2]), dim=2)
+        return outputs, (h, c)
 
 
 class Decoder(nn.Module):
@@ -226,6 +234,8 @@ class Decoder(nn.Module):
         self.lstm = nn.LSTM(
             output_size, hidden_size, num_layers, batch_first=True, dropout=0.2
         )
+        # Expect encoder outputs and hidden states of size ``hidden_size`` (i.e.,
+        # twice the base encoder hidden size due to bidirectionality)
         self.attn = nn.MultiheadAttention(
             embed_dim=hidden_size, num_heads=num_heads, batch_first=True
         )
@@ -293,7 +303,7 @@ class Seq2Seq(nn.Module):
         super().__init__()
         self.encoder = Encoder(input_size, hidden_size, num_layers)
         self.decoder = Decoder(
-            hidden_size, num_layers, output_size, num_heads, decoder_steps
+            hidden_size * 2, num_layers, output_size, num_heads, decoder_steps
         )
 
     def forward(
