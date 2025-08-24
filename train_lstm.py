@@ -36,7 +36,11 @@ print("Step 1: Loading and feature engineering...")
 train_df = pd.read_csv('train/train.csv')
 test_df = pd.concat([pd.read_csv(f) for f in glob.glob('test/*.csv')], ignore_index=True)
 sample_submission_df = pd.read_csv('sample_submission.csv') # NameError 해결
+sample_submission_df['영업일자'] = pd.to_datetime(sample_submission_df['영업일자'])
+train_df['source'] = 'train'
+test_df['source'] = 'test'
 combined_df = pd.concat([train_df, test_df], ignore_index=True)
+combined_df.loc[combined_df['source'] == 'test', '매출수량'] = np.nan
 print(f"DEBUG after concat: NaNs count = {combined_df['매출수량'].isna().sum()}")
 
 def create_features(df):
@@ -89,6 +93,7 @@ target_col = '매출수량'
 scaler = MinMaxScaler()
 combined_df[features_to_scale] = scaler.fit_transform(combined_df[features_to_scale])
 target_scaler = MinMaxScaler()
+combined_df[target_col] = combined_df[target_col].astype(float)
 combined_df.loc[combined_df[target_col].notna(), target_col] = target_scaler.fit_transform(combined_df.loc[combined_df[target_col].notna(), [target_col]])
 
 def create_sequences(data, features, target, seq_length):
