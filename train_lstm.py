@@ -1,0 +1,276 @@
+import pandas as pd
+import numpy as np
+import glob
+import os
+from sklearn.preprocessing import LabelEncoder, MinMaxScaler
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
+
+print("PyTorch LSTM-based demand forecasting script started.")
+
+# --- 0. 설정 및 SMAPE 함수 ---
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {DEVICE}")
+
+# 하이퍼파라미터
+SEQUENCE_LENGTH = 14
+BATCH_SIZE = 64
+LEARNING_RATE = 0.001
+NUM_EPOCHS = 50  # 에포크 수 증가
+HIDDEN_SIZE = 128 # 모델 용량 증가
+NUM_LAYERS = 2
+PATIENCE = 10 # 조기 종료를 위한 patience
+
+def smape(y_true, y_pred):
+    y_true = np.array(y_true)
+    y_pred = np.array(y_pred)
+    numerator = np.abs(y_pred - y_true)
+    denominator = (np.abs(y_true) + np.abs(y_pred)) / 2
+    ratio = np.where(denominator == 0, 0, numerator / denominator)
+    return np.mean(ratio) * 100
+
+# --- 1. 데이터 로딩 및 피처 엔지니어링 ---
+print("Step 1: Loading and feature engineering...")
+train_df = pd.read_csv('train/train.csv')
+test_df = pd.concat([pd.read_csv(f) for f in glob.glob('test/*.csv')], ignore_index=True)
+sample_submission_df = pd.read_csv('sample_submission.csv') # NameError 해결
+combined_df = pd.concat([train_df, test_df], ignore_index=True)
+print(f"DEBUG after concat: NaNs count = {combined_df['매출수량'].isna().sum()}")
+
+def create_features(df):
+    df[['영업장명', '메뉴명']] = df['영업장명_메뉴명'].str.split('_', n=1, expand=True)
+    df['영업일자'] = pd.to_datetime(df['영업일자'])
+    df['dayofweek'] = df['영업일자'].dt.dayofweek
+    df['month'] = df['영업일자'].dt.month
+    return df
+
+combined_df = create_features(combined_df)
+print(f"DEBUG after create_features: NaNs count = {combined_df['매출수량'].isna().sum()}")
+
+for col in ['영업장명', '메뉴명']:
+    le = LabelEncoder()
+    combined_df[col+'_encoded'] = le.fit_transform(combined_df[col])
+print(f"DEBUG after label_encoding: NaNs count = {combined_df['매출수량'].isna().sum()}")
+
+combined_df = combined_df.sort_values(by=['영업장명_메뉴명', '영업일자'])
+print(f"DEBUG after sort_values: NaNs count = {combined_df['매출수량'].isna().sum()}")
+
+lags = [1, 7, 14]
+for lag in lags:
+    combined_df[f'lag_{lag}'] = combined_df.groupby('영업장명_메뉴명')['매출수량'].shift(lag)
+print(f"DEBUG after lag_creation: NaNs count = {combined_df['매출수량'].isna().sum()}")
+
+corr_files = glob.glob('data/*.csv')
+corr_matrices = {os.path.basename(f).replace('.csv', ''): pd.read_csv(f, index_col=0) for f in corr_files}
+best_buddy_map = { (store, menu): corr_matrix[menu].drop(menu).idxmax() for store, corr_matrix in corr_matrices.items() for menu in corr_matrix.columns }
+combined_df['best_buddy'] = combined_df.set_index(['영업장명', '메뉴명']).index.map(best_buddy_map.get)
+print(f"DEBUG after best_buddy: NaNs count = {combined_df['매출수량'].isna().sum()}")
+
+lag1_sales_df = combined_df[['영업일자', '영업장명', '메뉴명', 'lag_1']].rename(columns={'lag_1': 'buddy_lag_1_sales'})
+combined_df = pd.merge(combined_df, lag1_sales_df, left_on=['영업일자', '영업장명', 'best_buddy'], right_on=['영업일자', '영업장명', '메뉴명'], how='left', suffixes=('', '_buddy'))
+print(f"DEBUG after merge: NaNs count = {combined_df['매출수량'].isna().sum()}")
+
+# 피처 생성 과정에서 생긴 NaN만 0으로 채움 (예측 대상인 매출수량의 NaN은 유지)
+cols_to_fill = [f'lag_{lag}' for lag in lags] + ['buddy_lag_1_sales']
+for col in cols_to_fill:
+    # 경고를 해결하고 더 안전한 방식으로 NaN 값을 채움
+    combined_df[col] = combined_df[col].fillna(0)
+
+# 수정이 잘 적용되었는지 확인하기 위한 디버그 코드
+print(f"DEBUG after targeted fillna: NaNs count = {combined_df['매출수량'].isna().sum()}")
+
+# --- 2. 데이터 전처리 ---
+print("Step 2: Scaling and creating sequences...")
+features_to_scale = ['dayofweek', 'month', '영업장명_encoded', '메뉴명_encoded', 'lag_1', 'lag_7', 'lag_14', 'buddy_lag_1_sales']
+target_col = '매출수량'
+
+scaler = MinMaxScaler()
+combined_df[features_to_scale] = scaler.fit_transform(combined_df[features_to_scale])
+target_scaler = MinMaxScaler()
+combined_df.loc[combined_df[target_col].notna(), target_col] = target_scaler.fit_transform(combined_df.loc[combined_df[target_col].notna(), [target_col]])
+
+def create_sequences(data, features, target, seq_length):
+    xs, ys = [], []
+    for _, group in data.groupby('영업장명_메뉴명'):
+        feature_data = group[features].values
+        target_data = group[target].values
+        for i in range(len(group) - seq_length):
+            xs.append(feature_data[i:i+seq_length])
+            ys.append(target_data[i+seq_length])
+    return np.array(xs), np.array(ys)
+
+features = features_to_scale
+train_data = combined_df[combined_df['매출수량'].notna()]
+X, y = create_sequences(train_data, features, [target_col], SEQUENCE_LENGTH)
+
+X_train, X_val, y_train, y_val = X[:int(len(X)*0.9)], X[int(len(X)*0.9):], y[:int(len(y)*0.9)], y[int(len(y)*0.9):]
+
+# --- 3. PyTorch Dataset 및 DataLoader ---
+print("Step 3: Creating PyTorch Datasets and Dataloaders...")
+class SalesDataset(Dataset):
+    def __init__(self, X, y):
+        self.X = torch.tensor(X, dtype=torch.float32)
+        self.y = torch.tensor(y, dtype=torch.float32)
+    def __len__(self):
+        return len(self.X)
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+train_dataset = SalesDataset(X_train, y_train)
+val_dataset = SalesDataset(X_val, y_val)
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+
+# --- 4. LSTM 모델 정의 ---
+print("Step 4: Defining LSTM model...")
+class LSTMModel(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers):
+        super(LSTMModel, self).__init__()
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=0.2)
+        self.fc = nn.Linear(hidden_size, 1)
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        out = self.fc(out[:, -1, :])
+        return out
+
+model = LSTMModel(input_size=len(features), hidden_size=HIDDEN_SIZE, num_layers=NUM_LAYERS).to(DEVICE)
+criterion = nn.MSELoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5, verbose=True)
+
+# --- 5. 모델 훈련 및 검증 ---
+print("Step 5: Training and validating model...")
+best_val_smape = float('inf')
+patience_counter = 0
+
+epoch_iterator = tqdm(range(NUM_EPOCHS), desc="Training Epochs")
+for epoch in epoch_iterator:
+    model.train()
+    for inputs, labels in train_loader:
+        inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
+        optimizer.zero_grad()
+        outputs = model(inputs)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+
+    model.eval()
+    val_loss, all_preds, all_labels = 0, [], []
+    with torch.no_grad():
+        for inputs, labels in val_loader:
+            inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
+            outputs = model(inputs)
+            val_loss += criterion(outputs, labels).item()
+            all_preds.append(outputs.cpu().numpy())
+            all_labels.append(labels.cpu().numpy())
+    
+    val_loss /= len(val_loader)
+    scheduler.step(val_loss) # 스케줄러 step
+
+    all_preds = np.concatenate(all_preds)
+    all_labels = np.concatenate(all_labels)
+    all_preds_unscaled = target_scaler.inverse_transform(all_preds)
+    all_labels_unscaled = target_scaler.inverse_transform(all_labels)
+    val_smape = smape(all_labels_unscaled, all_preds_unscaled)
+
+    epoch_iterator.set_postfix(val_loss=f"{val_loss:.6f}", val_smape=f"{val_smape:.4f}")
+
+    if val_smape < best_val_smape:
+        best_val_smape = val_smape
+        patience_counter = 0
+        torch.save(model.state_dict(), 'best_lstm_model.pth')
+        tqdm.write(f"Epoch {epoch+1}: Validation SMAPE improved to {val_smape:.4f}. Saving model...")
+    else:
+        patience_counter += 1
+        if patience_counter >= PATIENCE:
+            print(f"\nEarly stopping triggered after {PATIENCE} epochs of no improvement.")
+            break
+
+
+
+# --- 6. 최종 예측 및 제출 ---
+print("Step 6: Predicting and creating submission file with recursive forecasting (including buddy feature)...")
+
+# 가장 좋았던 모델 가중치 로드
+model.load_state_dict(torch.load('best_lstm_model.pth'))
+model.eval()
+
+# 전체 데이터프레임 복사하여 예측용으로 사용
+recursive_df = combined_df.copy()
+
+# 예측 대상이 되는 날짜들을 순서대로 가져옴
+prediction_dates = sorted(pd.to_datetime(recursive_df[recursive_df['매출수량'].isna()]['영업일자'].unique()))
+
+# 예측 대상 인덱스 저장 (최종 결과 추출용)
+test_indices = recursive_df[recursive_df['매출수량'].isna()].index
+
+with torch.no_grad():
+    for current_date in tqdm(prediction_dates, desc="Recursive Prediction by Date"):
+        
+        # --- 1. 현재 날짜(current_date)에 대한 예측 수행 ---
+        rows_to_predict_idx = recursive_df[recursive_df['영업일자'] == current_date].index
+        todays_predictions = {} # {item_id: scaled_prediction}
+
+        for idx in rows_to_predict_idx:
+            item_id = recursive_df.loc[idx, '영업장명_메뉴명']
+            
+            # 입력 시퀀스 준비 (current_date 이전 데이터 사용)
+            item_history = recursive_df[(recursive_df['영업장명_메뉴명'] == item_id) & (recursive_df['영업일자'] < current_date)]
+            sequence_data = item_history.tail(SEQUENCE_LENGTH)
+            
+            if len(sequence_data) < SEQUENCE_LENGTH:
+                predicted_value_scaled = 0.0
+            else:
+                input_features = sequence_data[features].values
+                input_tensor = torch.tensor([input_features], dtype=torch.float32).to(DEVICE)
+                prediction_scaled = model(input_tensor)
+                predicted_value_scaled = prediction_scaled.cpu().numpy()[0][0]
+            
+            todays_predictions[item_id] = predicted_value_scaled
+        
+        # --- 2. 예측된 값으로 데이터프레임 업데이트 ---
+        for item_id, pred_val in todays_predictions.items():
+            idx_to_update = recursive_df[
+                (recursive_df['영업일자'] == current_date) & 
+                (recursive_df['영업장명_메뉴명'] == item_id)
+            ].index
+            if not idx_to_update.empty:
+                recursive_df.loc[idx_to_update, '매출수량'] = pred_val
+
+        # --- 3. 업데이트된 예측값을 기반으로 미래(future dates)의 피처 업데이트 ---
+        # lag_1, lag_7, lag_14 업데이트
+        for item_id, pred_val in todays_predictions.items():
+            for lag_days in [1, 7, 14]:
+                future_date = current_date + pd.Timedelta(days=lag_days)
+                future_idx = recursive_df.index[
+                    (recursive_df['영업일자'] == future_date) &
+                    (recursive_df['영업장명_메뉴명'] == item_id)
+                ]
+                if not future_idx.empty:
+                    recursive_df.loc[future_idx[0], f'lag_{lag_days}'] = pred_val
+
+        # buddy_lag_1_sales 업데이트
+        next_day = current_date + pd.Timedelta(days=1)
+        next_day_rows_idx = recursive_df[recursive_df['영업일자'] == next_day].index
+        for idx in next_day_rows_idx:
+            buddy_item_id = recursive_df.loc[idx, 'best_buddy']
+            if pd.notna(buddy_item_id) and buddy_item_id in todays_predictions:
+                recursive_df.loc[idx, 'buddy_lag_1_sales'] = todays_predictions[buddy_item_id]
+
+
+# --- 4. 최종 결과 처리 ---
+# 예측된 값들의 스케일을 원래대로 복원
+predicted_values_scaled = recursive_df.loc[test_indices, '매출수량'].values.reshape(-1, 1)
+predicted_values_unscaled = target_scaler.inverse_transform(predicted_values_scaled)
+recursive_df.loc[test_indices, '매출수량'] = predicted_values_unscaled.flatten()
+
+# --- 5. 제출 파일 생성 ---
+submission_df = recursive_df.loc[test_indices].pivot_table(index='영업일자', columns='영업장명_메뉴명', values='매출수량').reset_index()
+final_submission = sample_submission_df[['영업일자']].merge(submission_df, on='영업일자', how='left')
+final_submission.fillna(0, inplace=True)
+final_submission = final_submission[sample_submission_df.columns]
+
+final_submission.to_csv("lstm_submission_recursive_full.csv", index=False)
+print("Submission file created successfully at: lstm_submission_recursive_full.csv")
