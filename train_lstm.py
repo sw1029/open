@@ -58,9 +58,11 @@ def create_features_train(df):
 
 def create_features_test(df):
     df[['영업장명', '메뉴명']] = df['영업장명_메뉴명'].str.split('_', n=1, expand=True)
-    # test 데이터는 날짜 변환 없이 placeholder 값으로 채움
-    df['dayofweek'] = -1 
-    df['month'] = -1
+    # test 데이터의 '영업일자'는 문자열로 주어지므로 실제 날짜로 변환
+    df['영업일자'] = pd.to_datetime(df['영업일자'], errors='coerce')
+    # 변환된 날짜를 이용해 요일과 월을 계산하고, 파싱 실패 시 -1로 채움
+    df['dayofweek'] = df['영업일자'].dt.dayofweek.fillna(-1).astype(int)
+    df['month'] = df['영업일자'].dt.month.fillna(-1).astype(int)
     return df
 
 # train_df와 test_df에 각각 다른 피처 엔지니어링 함수 적용
@@ -118,8 +120,10 @@ target_col = '매출수량'
 # 로그 변환 적용 (매출수량이 NaN이 아닌 경우에만)
 combined_df.loc[combined_df[target_col].notna(), target_col] = combined_df.loc[combined_df[target_col].notna(), target_col].apply(lambda x: np.log1p(x) if x > 0 else 0)
 
+# 학습 데이터에 기반해 스케일러를 학습시키고, 동일한 스케일을 테스트 데이터에도 적용
 scaler = MinMaxScaler()
-combined_df[features_to_scale] = scaler.fit_transform(combined_df[features_to_scale])
+scaler.fit(combined_df[combined_df['source'] == 'train'][features_to_scale])
+combined_df[features_to_scale] = scaler.transform(combined_df[features_to_scale])
 
 scalers = {}
 for item_id in tqdm(combined_df['영업장명_메뉴명'].unique(), desc="Scaling target by item"):
