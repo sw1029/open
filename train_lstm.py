@@ -442,7 +442,7 @@ with torch.no_grad():
                 predicted_seq = np.repeat(init_val, len(current_dates))
             else:
                 input_features = sequence_data[features].values
-                input_tensor = torch.tensor([input_features], dtype=torch.float32).to(DEVICE)
+                input_tensor = torch.tensor(np.array([input_features]), dtype=torch.float32).to(DEVICE)
                 prediction_scaled = model(input_tensor).cpu().numpy()[0]
                 predicted_seq = prediction_scaled[:len(current_dates)]
             batch_predictions[item_id] = predicted_seq
