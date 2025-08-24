@@ -39,12 +39,15 @@ class SMAPELoss(nn.Module):
         y_pred: torch.Tensor,
         y_true: torch.Tensor,
         weights: torch.Tensor | None = None,
+        time_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         numerator = torch.abs(y_pred - y_true)
         denominator = (torch.abs(y_true) + torch.abs(y_pred)) / 2 + self.eps
         loss = numerator / denominator
         if weights is not None:
             loss = loss * weights
+        if time_weights is not None:
+            loss = loss * time_weights
         if self.reduction == "none":
             return loss
         if self.reduction == "sum":

@@ -162,6 +162,8 @@ def main():
             update_sampling_prob(epoch)
             alpha = get_alpha(total_epoch)
             model.train()
+            time_weights = torch.linspace(1.0, 2.0, curr_len, device=DEVICE)
+            time_weights = (time_weights / time_weights.mean()).unsqueeze(0)
             for inputs, labels, batch_item_ids, future_feats in train_loader:
                 inputs, labels, future_feats = inputs.to(DEVICE), labels.to(DEVICE), future_feats.to(DEVICE)
                 weights = (
@@ -177,8 +179,9 @@ def main():
                     SCHEDULED_SAMPLING_PROB,
                     future_feats,
                 )
-                l1_loss = (criterion(outputs, labels) * weights).mean()
-                smape_loss = smape_loss_fn(outputs, labels, weights).mean()
+                combined_w = weights * time_weights
+                l1_loss = (criterion(outputs, labels) * combined_w).mean()
+                smape_loss = smape_loss_fn(outputs, labels, weights, time_weights).mean()
                 loss = alpha * l1_loss + (1 - alpha) * smape_loss
                 loss.backward()
                 optimizer.step()
@@ -198,8 +201,9 @@ def main():
                         .to(DEVICE)
                     )
                     outputs = model(inputs, curr_len, future_feats=future_feats)
-                    batch_l1 = (criterion(outputs, labels) * weights).mean()
-                    batch_smape = smape_loss_fn(outputs, labels, weights).mean()
+                    combined_w = weights * time_weights
+                    batch_l1 = (criterion(outputs, labels) * combined_w).mean()
+                    batch_smape = smape_loss_fn(outputs, labels, weights, time_weights).mean()
                     batch_loss = alpha * batch_l1 + (1 - alpha) * batch_smape
                     val_loss += batch_loss.item()
                     all_preds.append(outputs.cpu().numpy())
