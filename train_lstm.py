@@ -32,6 +32,23 @@ def smape(y_true, y_pred):
     ratio = np.where(denominator == 0, 0, numerator / denominator)
     return np.mean(ratio) * 100
 
+
+class SMAPELoss(nn.Module):
+    """SMAPE loss that avoids division by zero.
+
+    The denominator uses the sum of absolute values with a small epsilon
+    to stabilize training when both prediction and target are zero.
+    """
+
+    def __init__(self, eps: float = 1e-8):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+        numerator = torch.abs(y_pred - y_true)
+        denominator = torch.abs(y_true) + torch.abs(y_pred) + self.eps
+        return (2.0 * numerator / denominator).mean()
+
 def get_future_date_str(date_str, days_to_add):
     """ 'TEST_00+1일' 형식의 문자열 날짜를 days_to_add 만큼 더한 문자열을 반환 """
     try:
@@ -230,7 +247,8 @@ class LSTMModel(nn.Module):
         return out
 
 model = LSTMModel(input_size=len(features), hidden_size=HIDDEN_SIZE, num_layers=NUM_LAYERS, output_size=PREDICT_LENGTH).to(DEVICE)
-criterion = nn.MSELoss()
+criterion = nn.SmoothL1Loss()
+smape_loss_fn = SMAPELoss()
 optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5, verbose=True)
 
@@ -246,7 +264,7 @@ for epoch in epoch_iterator:
         inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
         optimizer.zero_grad()
         outputs = model(inputs)
-        loss = criterion(outputs, labels)
+        loss = criterion(outputs, labels) + smape_loss_fn(outputs, labels)
         loss.backward()
         optimizer.step()
 
@@ -256,7 +274,8 @@ for epoch in epoch_iterator:
         for inputs, labels, batch_item_ids in val_loader:
             inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
             outputs = model(inputs)
-            val_loss += criterion(outputs, labels).item()
+            batch_loss = criterion(outputs, labels) + smape_loss_fn(outputs, labels)
+            val_loss += batch_loss.item()
             all_preds.append(outputs.cpu().numpy())
             all_labels.append(labels.cpu().numpy())
             all_item_ids.append(np.repeat(batch_item_ids, PREDICT_LENGTH))
