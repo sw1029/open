@@ -94,6 +94,7 @@ def main():
         scalers,
         combined_df,
         features,
+        future_features,
         target_col,
         sample_submission_df,
         submission_date_map,
@@ -114,6 +115,7 @@ def main():
         decoder_steps=final_predict_length,
         cnn_channels=cnn_channels,
         kernel_size=kernel_size,
+        future_feat_dim=len(future_features),
     ).to(DEVICE)
     criterion = nn.SmoothL1Loss(reduction="none")
     smape_loss_fn = SMAPELoss(reduction="none")
@@ -136,6 +138,7 @@ def main():
                 scalers,
                 combined_df,
                 features,
+                future_features,
                 target_col,
                 sample_submission_df,
                 submission_date_map,
@@ -159,15 +162,21 @@ def main():
             update_sampling_prob(epoch)
             alpha = get_alpha(total_epoch)
             model.train()
-            for inputs, labels, batch_item_ids in train_loader:
-                inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
+            for inputs, labels, batch_item_ids, future_feats in train_loader:
+                inputs, labels, future_feats = inputs.to(DEVICE), labels.to(DEVICE), future_feats.to(DEVICE)
                 weights = (
                     torch.tensor([item_weights[item] for item in batch_item_ids], dtype=torch.float32)
                     .unsqueeze(1)
                     .to(DEVICE)
                 )
                 optimizer.zero_grad()
-                outputs = model(inputs, curr_len, labels, SCHEDULED_SAMPLING_PROB)
+                outputs = model(
+                    inputs,
+                    curr_len,
+                    labels,
+                    SCHEDULED_SAMPLING_PROB,
+                    future_feats,
+                )
                 l1_loss = (criterion(outputs, labels) * weights).mean()
                 smape_loss = smape_loss_fn(outputs, labels, weights).mean()
                 loss = alpha * l1_loss + (1 - alpha) * smape_loss
@@ -177,14 +186,18 @@ def main():
             model.eval()
             val_loss, all_preds, all_labels, all_item_ids = 0, [], [], []
             with torch.no_grad():
-                for inputs, labels, batch_item_ids in val_loader:
-                    inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
+                for inputs, labels, batch_item_ids, future_feats in val_loader:
+                    inputs, labels, future_feats = (
+                        inputs.to(DEVICE),
+                        labels.to(DEVICE),
+                        future_feats.to(DEVICE),
+                    )
                     weights = (
                         torch.tensor([item_weights[item] for item in batch_item_ids], dtype=torch.float32)
                         .unsqueeze(1)
                         .to(DEVICE)
                     )
-                    outputs = model(inputs, curr_len)
+                    outputs = model(inputs, curr_len, future_feats=future_feats)
                     batch_l1 = (criterion(outputs, labels) * weights).mean()
                     batch_smape = smape_loss_fn(outputs, labels, weights).mean()
                     batch_loss = alpha * batch_l1 + (1 - alpha) * batch_smape
@@ -282,6 +295,7 @@ def main():
         combined_df,
         scalers,
         features,
+        future_features,
         target_col,
         sample_submission_df,
         submission_date_map,
