@@ -23,6 +23,10 @@ test_files = glob.glob('test/*.csv')
 test_df_list = []
 for file in test_files:
     temp_df = pd.read_csv(file)
+    test_id = os.path.splitext(os.path.basename(file))[0]
+    temp_df['test_id'] = test_id
+    temp_df['영업일자'] = pd.to_datetime(temp_df['영업일자'])
+    temp_df['submission_date'] = [f"{test_id}+{i+1}일" for i in range(len(temp_df))]
     test_df_list.append(temp_df)
 test_df = pd.concat(test_df_list, ignore_index=True)
 sample_submission_df = pd.read_csv('sample_submission.csv')
@@ -169,7 +173,14 @@ predictions[predictions < 0] = 0
 test_df.loc[:, '매출수량'] = predictions.astype(int)
 
 
-submission_df = test_df.pivot_table(index='영업일자', columns='영업장명_메뉴명', values='매출수량').reset_index()
+submission_df = (
+    test_df.pivot_table(index='submission_date', columns='영업장명_메뉴명', values='매출수량')
+    .reset_index()
+)
+submission_df = sample_submission_df[['영업일자']].merge(
+    submission_df, left_on='영업일자', right_on='submission_date', how='left'
+)
+submission_df.drop(columns=['submission_date'], inplace=True)
 submission_df = submission_df.reindex(columns=sample_submission_df.columns)
 submission_df.fillna(0, inplace=True)
 

@@ -67,7 +67,16 @@ def get_future_date_str(date_str, days_to_add):
 # --- 1. 데이터 로딩 및 피처 엔지니어링 ---
 print("Step 1: Loading and feature engineering...")
 train_df = pd.read_csv('train/train.csv')
-test_df = pd.concat([pd.read_csv(f) for f in glob.glob('test/*.csv')], ignore_index=True)
+test_files = glob.glob('test/*.csv')
+test_df_list = []
+for file in test_files:
+    temp_df = pd.read_csv(file)
+    test_id = os.path.splitext(os.path.basename(file))[0]
+    temp_df['test_id'] = test_id
+    temp_df['영업일자'] = pd.to_datetime(temp_df['영업일자'])
+    temp_df['submission_date'] = [f"{test_id}+{i+1}일" for i in range(len(temp_df))]
+    test_df_list.append(temp_df)
+test_df = pd.concat(test_df_list, ignore_index=True)
 sample_submission_df = pd.read_csv('sample_submission.csv')
 
 def create_features_train(df):
@@ -454,12 +463,13 @@ recursive_df.loc[test_indices, '매출수량'] = submission_df_for_inverse['매�
 # --- 5. 제출 파일 생성 ---
 submission_df = (
     recursive_df.loc[test_indices]
-    .pivot_table(index='영업일자', columns='영업장명_메뉴명', values='매출수량')
+    .pivot_table(index='submission_date', columns='영업장명_메뉴명', values='매출수량')
     .reset_index()
 )
 final_submission = sample_submission_df[['영업일자']].merge(
-    submission_df, on='영업일자', how='left'
+    submission_df, left_on='영업일자', right_on='submission_date', how='left'
 )
+final_submission.drop(columns=['submission_date'], inplace=True)
 
 # 결측치 확인: 존재하면 상세 정보 출력 후 실행 중단
 na_counts = final_submission.isna().sum()
