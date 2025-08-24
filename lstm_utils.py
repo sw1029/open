@@ -29,14 +29,27 @@ def smape(y_true, y_pred, eps: float = 1e-8):
 
 
 class SMAPELoss(nn.Module):
-    def __init__(self, eps: float = 1e-8):
+    def __init__(self, eps: float = 1e-8, reduction: str = "mean"):
         super().__init__()
         self.eps = eps
+        self.reduction = reduction
 
-    def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        y_pred: torch.Tensor,
+        y_true: torch.Tensor,
+        weights: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         numerator = torch.abs(y_pred - y_true)
         denominator = (torch.abs(y_true) + torch.abs(y_pred)) / 2 + self.eps
-        return (numerator / denominator).mean()
+        loss = numerator / denominator
+        if weights is not None:
+            loss = loss * weights
+        if self.reduction == "none":
+            return loss
+        if self.reduction == "sum":
+            return loss.sum()
+        return loss.mean()
 
 
 def get_future_date_str(date_str: str, days_to_add: int, mapping: Dict[str, str]):
@@ -279,8 +292,24 @@ def prepare_datasets(sequence_length: int, predict_length: int, batch_size: int)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
     test_indices = combined_df[combined_df['매출수량'].isna()].index
+    item_weights = {}
+    for item_id in combined_df['영업장명_메뉴명'].unique():
+        store = item_id.split('_')[0]
+        item_weights[item_id] = 2.0 if store in ['담하', '미라시아'] else 1.0
 
-    return train_loader, val_loader, scalers, combined_df, features, target_col, sample_submission_df, submission_date_map, submission_to_date_map, test_indices
+    return (
+        train_loader,
+        val_loader,
+        scalers,
+        combined_df,
+        features,
+        target_col,
+        sample_submission_df,
+        submission_date_map,
+        submission_to_date_map,
+        test_indices,
+        item_weights,
+    )
 
 
 def predict_and_submit(model: nn.Module, combined_df: pd.DataFrame, scalers: Dict[str, MinMaxScaler],
