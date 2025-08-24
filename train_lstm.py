@@ -397,6 +397,18 @@ for item_id in tqdm(submission_df_for_inverse['영업장명_메뉴명'].unique()
         predicted_values_original[predicted_values_original < 0] = 0
         
         submission_df_for_inverse.loc[item_indices, '매출수량'] = predicted_values_original.flatten()
+    else:
+        # 스케일러가 없는 품목은 로그 변환만 역변환
+        item_indices = submission_df_for_inverse[submission_df_for_inverse['영업장명_메뉴명'] == item_id].index
+        predicted_values_scaled = submission_df_for_inverse.loc[item_indices, '매출수량'].values
+
+        # 로그 변환 역변환
+        predicted_values_original = np.expm1(predicted_values_scaled)
+
+        # 음수 값은 0으로 처리
+        predicted_values_original[predicted_values_original < 0] = 0
+
+        submission_df_for_inverse.loc[item_indices, '매출수량'] = predicted_values_original
 
 # 최종적으로 recursive_df에 역변환된 값을 반영
 recursive_df.loc[test_indices, '매출수량'] = submission_df_for_inverse['매출수량']
