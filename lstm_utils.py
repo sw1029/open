@@ -72,6 +72,32 @@ def get_future_date_str(date_str: str, days_to_add: int, mapping: Dict[str, str]
         return f"TEST_{future_date.strftime('%Y-%m-%d')}"
 
 
+def update_buddy_lag_sales(
+    df: pd.DataFrame,
+    day_predictions: Dict[str, Any],
+    current_date: str,
+    submission_date_map: Dict[str, str],
+) -> None:
+    """Update ``buddy_lag_1_sales`` using only same-item predictions.
+
+    For rows corresponding to the day after ``current_date``, this function
+    fills ``buddy_lag_1_sales`` with the predicted value of the *same* item, if
+    available. Predictions from different items are intentionally ignored to
+    prevent cross-sample information leakage.
+    """
+    next_day = get_future_date_str(current_date, 1, submission_date_map)
+    next_day_rows_idx = df[df['submission_date'] == next_day].index
+    for idx in next_day_rows_idx:
+        current_item_id = df.loc[idx, '영업장명_메뉴명']
+        buddy_item_id = df.loc[idx, 'best_buddy']
+        if (
+            pd.notna(buddy_item_id)
+            and buddy_item_id == current_item_id
+            and buddy_item_id in day_predictions
+        ):
+            df.loc[idx, 'buddy_lag_1_sales'] = day_predictions[buddy_item_id]
+
+
 def create_features_train(df: pd.DataFrame) -> pd.DataFrame:
     df[['영업장명', '메뉴명']] = df['영업장명_메뉴명'].str.split('_', n=1, expand=True)
     df['영업일자'] = pd.to_datetime(df['영업일자'])
@@ -823,12 +849,9 @@ def predict_and_submit(
                         ]
                         if not future_idx.empty:
                             recursive_df.loc[future_idx[0], f'lag_{lag_days}'] = pred_val
-                next_day = get_future_date_str(current_date, 1, submission_date_map)
-                next_day_rows_idx = recursive_df[recursive_df['submission_date'] == next_day].index
-                for idx in next_day_rows_idx:
-                    buddy_item_id = recursive_df.loc[idx, 'best_buddy']
-                    if pd.notna(buddy_item_id) and buddy_item_id in day_predictions:
-                        recursive_df.loc[idx, 'buddy_lag_1_sales'] = day_predictions[buddy_item_id]
+                update_buddy_lag_sales(
+                    recursive_df, day_predictions, current_date, submission_date_map
+                )
 
     submission_df_for_inverse = recursive_df.loc[test_idx_series].copy()
     for item_id in tqdm(submission_df_for_inverse['영업장명_메뉴명'].unique(), desc="Inverse transforming predictions"):
