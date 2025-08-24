@@ -74,11 +74,39 @@ def main():
         default=3,
         help="Kernel size of initial Conv1d block.",
     )
+    parser.add_argument(
+        "--num_stores",
+        type=int,
+        default=None,
+        help="Number of unique stores for embeddings.",
+    )
+    parser.add_argument(
+        "--num_items",
+        type=int,
+        default=None,
+        help="Number of unique items for embeddings.",
+    )
+    parser.add_argument(
+        "--emb_dim_store",
+        type=int,
+        default=8,
+        help="Embedding dimension for stores.",
+    )
+    parser.add_argument(
+        "--emb_dim_item",
+        type=int,
+        default=8,
+        help="Embedding dimension for items.",
+    )
     args = parser.parse_args()
     final_predict_length = args.decoder_steps
     num_heads = args.num_heads
     cnn_channels = args.cnn_channels
     kernel_size = args.kernel_size
+    num_stores = args.num_stores
+    num_items = args.num_items
+    emb_dim_store = args.emb_dim_store
+    emb_dim_item = args.emb_dim_item
 
     logging.basicConfig(level=logging.INFO)
     print("PyTorch LSTM-based demand forecasting script started.")
@@ -106,6 +134,11 @@ def main():
     if cnn_channels is None:
         cnn_channels = len(features)
 
+    if num_stores is None:
+        num_stores = int(combined_df['영업장명_encoded'].nunique())
+    if num_items is None:
+        num_items = int(combined_df['메뉴명_encoded'].nunique())
+
     model = Seq2Seq(
         input_size=len(features),
         hidden_size=HIDDEN_SIZE,
@@ -116,6 +149,10 @@ def main():
         cnn_channels=cnn_channels,
         kernel_size=kernel_size,
         future_feat_dim=len(future_features),
+        num_stores=num_stores,
+        num_items=num_items,
+        emb_dim_store=emb_dim_store,
+        emb_dim_item=emb_dim_item,
     ).to(DEVICE)
     criterion = nn.SmoothL1Loss(reduction="none")
     smape_loss_fn = SMAPELoss(reduction="none")
@@ -162,8 +199,19 @@ def main():
             update_sampling_prob(epoch)
             alpha = get_alpha(total_epoch)
             model.train()
-            for inputs, labels, batch_item_ids, future_feats in train_loader:
-                inputs, labels, future_feats = inputs.to(DEVICE), labels.to(DEVICE), future_feats.to(DEVICE)
+            for (
+                inputs,
+                labels,
+                batch_item_ids,
+                future_feats,
+                store_idx,
+                item_idx,
+            ) in train_loader:
+                inputs = inputs.to(DEVICE)
+                labels = labels.to(DEVICE)
+                future_feats = future_feats.to(DEVICE)
+                store_idx = store_idx.to(DEVICE)
+                item_idx = item_idx.to(DEVICE)
                 weights = (
                     torch.tensor([item_weights[item] for item in batch_item_ids], dtype=torch.float32)
                     .unsqueeze(1)
@@ -172,6 +220,8 @@ def main():
                 optimizer.zero_grad()
                 outputs = model(
                     inputs,
+                    store_idx,
+                    item_idx,
                     curr_len,
                     labels,
                     SCHEDULED_SAMPLING_PROB,
@@ -186,18 +236,31 @@ def main():
             model.eval()
             val_loss, all_preds, all_labels, all_item_ids = 0, [], [], []
             with torch.no_grad():
-                for inputs, labels, batch_item_ids, future_feats in val_loader:
-                    inputs, labels, future_feats = (
-                        inputs.to(DEVICE),
-                        labels.to(DEVICE),
-                        future_feats.to(DEVICE),
-                    )
+                for (
+                    inputs,
+                    labels,
+                    batch_item_ids,
+                    future_feats,
+                    store_idx,
+                    item_idx,
+                ) in val_loader:
+                    inputs = inputs.to(DEVICE)
+                    labels = labels.to(DEVICE)
+                    future_feats = future_feats.to(DEVICE)
+                    store_idx = store_idx.to(DEVICE)
+                    item_idx = item_idx.to(DEVICE)
                     weights = (
                         torch.tensor([item_weights[item] for item in batch_item_ids], dtype=torch.float32)
                         .unsqueeze(1)
                         .to(DEVICE)
                     )
-                    outputs = model(inputs, curr_len, future_feats=future_feats)
+                    outputs = model(
+                        inputs,
+                        store_idx,
+                        item_idx,
+                        curr_len,
+                        future_feats=future_feats,
+                    )
                     batch_l1 = (criterion(outputs, labels) * weights).mean()
                     batch_smape = smape_loss_fn(outputs, labels, weights).mean()
                     batch_loss = alpha * batch_l1 + (1 - alpha) * batch_smape
