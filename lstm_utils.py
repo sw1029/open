@@ -141,6 +141,74 @@ class LSTMAttention(nn.Module):
         return out
 
 
+class Encoder(nn.Module):
+    """LSTM encoder that processes input sequences."""
+
+    def __init__(self, input_size: int, hidden_size: int, num_layers: int):
+        super().__init__()
+        self.lstm = nn.LSTM(
+            input_size, hidden_size, num_layers, batch_first=True, dropout=0.2
+        )
+
+    def forward(self, x):
+        outputs, hidden = self.lstm(x)
+        return outputs, hidden
+
+
+class Decoder(nn.Module):
+    """Decoder using multi-head attention to learn temporal patterns."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        output_size: int,
+        num_heads: int,
+        decoder_steps: int,
+    ):
+        super().__init__()
+        self.decoder_steps = decoder_steps
+        self.input_proj = nn.Linear(output_size, hidden_size)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=hidden_size, num_heads=num_heads, batch_first=True
+        )
+        self.fc = nn.Linear(hidden_size, output_size)
+        self.activation = nn.LeakyReLU()
+
+    def forward(self, encoder_outputs, tgt=None):
+        batch_size = encoder_outputs.size(0)
+        if tgt is None:
+            tgt = torch.zeros(
+                batch_size, self.decoder_steps, 1, device=encoder_outputs.device
+            )
+        query = self.input_proj(tgt)
+        attn_output, _ = self.attn(query, encoder_outputs, encoder_outputs)
+        out = self.fc(attn_output)
+        out = self.activation(out)
+        return out.squeeze(-1)
+
+
+class Seq2Seq(nn.Module):
+    """Sequence-to-sequence model with LSTM encoder and attention decoder."""
+
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int,
+        num_layers: int,
+        num_heads: int,
+        decoder_steps: int,
+        output_size: int = 1,
+    ):
+        super().__init__()
+        self.encoder = Encoder(input_size, hidden_size, num_layers)
+        self.decoder = Decoder(hidden_size, output_size, num_heads, decoder_steps)
+
+    def forward(self, src, tgt=None):
+        encoder_outputs, _ = self.encoder(src)
+        outputs = self.decoder(encoder_outputs, tgt)
+        return outputs
+
+
 def prepare_datasets(sequence_length: int, predict_length: int, batch_size: int):
     """Load data, apply feature engineering and create train/val dataloaders."""
     logging.info("Preparing datasets with sequence_length=%s predict_length=%s", sequence_length, predict_length)
@@ -329,7 +397,8 @@ def predict_and_submit(model: nn.Module, combined_df: pd.DataFrame, scalers: Dic
                 else:
                     input_features = sequence_data[features].values
                     input_tensor = torch.tensor(np.array([input_features]), dtype=torch.float32).to(DEVICE)
-                    prediction_scaled = model(input_tensor).cpu().numpy()[0]
+                    decoder_input = torch.zeros((1, predict_length, 1), device=DEVICE)
+                    prediction_scaled = model(input_tensor, decoder_input).cpu().numpy()[0]
                     predicted_seq = prediction_scaled[:len(current_dates)]
                 batch_predictions[item_id] = predicted_seq
 

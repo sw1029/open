@@ -1,3 +1,4 @@
+import argparse
 import logging
 import numpy as np
 import torch
@@ -7,7 +8,7 @@ from tqdm import tqdm
 from lstm_utils import (
     DEVICE,
     SMAPELoss,
-    LSTMAttention,
+    Seq2Seq,
     prepare_datasets,
     predict_and_submit,
     smape,
@@ -15,6 +16,7 @@ from lstm_utils import (
 
 
 SEQUENCE_LENGTH = 14
+# Default prediction length used if not provided via CLI
 PREDICT_LENGTH = 7
 BATCH_SIZE = 64
 LEARNING_RATE = 0.001
@@ -25,6 +27,16 @@ PATIENCE = 10
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--num_heads", type=int, default=4, help="Number of attention heads")
+    parser.add_argument(
+        "--decoder_steps",
+        type=int,
+        default=PREDICT_LENGTH,
+        help="Number of decoder time steps",
+    )
+    args = parser.parse_args()
+
     print("PyTorch LSTM-based demand forecasting script started.")
 
     (
@@ -38,13 +50,15 @@ def main():
         submission_date_map,
         submission_to_date_map,
         test_indices,
-    ) = prepare_datasets(SEQUENCE_LENGTH, PREDICT_LENGTH, BATCH_SIZE)
+    ) = prepare_datasets(SEQUENCE_LENGTH, args.decoder_steps, BATCH_SIZE)
 
-    model = LSTMAttention(
+    model = Seq2Seq(
         input_size=len(features),
         hidden_size=HIDDEN_SIZE,
         num_layers=NUM_LAYERS,
-        output_size=PREDICT_LENGTH,
+        num_heads=args.num_heads,
+        decoder_steps=args.decoder_steps,
+        output_size=1,
     ).to(DEVICE)
     criterion = nn.SmoothL1Loss()
     smape_loss_fn = SMAPELoss()
@@ -61,8 +75,11 @@ def main():
         model.train()
         for inputs, labels, _ in train_loader:
             inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
+            decoder_inputs = torch.zeros(
+                (labels.size(0), args.decoder_steps, 1), device=DEVICE
+            )
             optimizer.zero_grad()
-            outputs = model(inputs)
+            outputs = model(inputs, decoder_inputs)
             loss = criterion(outputs, labels) + smape_loss_fn(outputs, labels)
             loss.backward()
             optimizer.step()
@@ -72,12 +89,15 @@ def main():
         with torch.no_grad():
             for inputs, labels, batch_item_ids in val_loader:
                 inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
-                outputs = model(inputs)
+                decoder_inputs = torch.zeros(
+                    (labels.size(0), args.decoder_steps, 1), device=DEVICE
+                )
+                outputs = model(inputs, decoder_inputs)
                 batch_loss = criterion(outputs, labels) + smape_loss_fn(outputs, labels)
                 val_loss += batch_loss.item()
                 all_preds.append(outputs.cpu().numpy())
                 all_labels.append(labels.cpu().numpy())
-                all_item_ids.append(np.repeat(batch_item_ids, PREDICT_LENGTH))
+                all_item_ids.append(np.repeat(batch_item_ids, args.decoder_steps))
 
         val_loss /= len(val_loader)
         scheduler.step(val_loss)
@@ -142,7 +162,7 @@ def main():
         submission_to_date_map,
         test_indices,
         SEQUENCE_LENGTH,
-        PREDICT_LENGTH,
+        args.decoder_steps,
     )
 
 
