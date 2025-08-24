@@ -26,6 +26,8 @@ DEFAULT_PREDICT_LENGTH = 7
 DEFAULT_NUM_HEADS = 4
 
 SCHEDULED_SAMPLING_PROB = 0.1
+FINE_TUNE_EPOCHS = 3
+FINE_TUNE_LR = 1e-4
 
 
 def update_sampling_prob(epoch: int) -> None:
@@ -49,6 +51,7 @@ def get_alpha(epoch: int) -> float:
 
 
 def main():
+    global SCHEDULED_SAMPLING_PROB
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--num_heads",
@@ -353,6 +356,136 @@ def main():
             smape_val,
         )
 
+    # Fine-tuning with lower learning rate and full scheduled sampling
+    model.load_state_dict(torch.load("best_lstm_model.pth"))
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=FINE_TUNE_LR, weight_decay=1e-5
+    )
+    SCHEDULED_SAMPLING_PROB = 1.0
+    curr_len = final_predict_length
+    fine_tune_best = best_val_smape
+    for epoch in range(FINE_TUNE_EPOCHS):
+        model.train()
+        alpha = get_alpha(total_epoch)
+        time_weights = torch.linspace(1.0, 2.0, curr_len, device=DEVICE)
+        time_weights = (time_weights / time_weights.mean()).unsqueeze(0)
+        for (
+            inputs,
+            labels,
+            batch_item_ids,
+            future_feats,
+            store_idx,
+            item_idx,
+        ) in train_loader:
+            inputs = inputs.to(DEVICE)
+            labels = labels.to(DEVICE)
+            future_feats = future_feats.to(DEVICE)
+            store_idx = store_idx.to(DEVICE)
+            item_idx = item_idx.to(DEVICE)
+            weights = (
+                torch.tensor([item_weights[item] for item in batch_item_ids], dtype=torch.float32)
+                .unsqueeze(1)
+                .to(DEVICE)
+            )
+            optimizer.zero_grad()
+            outputs = model(
+                inputs,
+                store_idx,
+                item_idx,
+                curr_len,
+                labels,
+                SCHEDULED_SAMPLING_PROB,
+                future_feats,
+            )
+            combined_w = weights * time_weights
+            l1_loss = (criterion(outputs, labels) * combined_w).mean()
+            smape_loss = smape_loss_fn(outputs, labels, weights, time_weights).mean()
+            loss = alpha * l1_loss + (1 - alpha) * smape_loss
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+
+        model.eval()
+        val_loss, all_preds, all_labels, all_item_ids = 0, [], [], []
+        with torch.no_grad():
+            for (
+                inputs,
+                labels,
+                batch_item_ids,
+                future_feats,
+                store_idx,
+                item_idx,
+            ) in val_loader:
+                inputs = inputs.to(DEVICE)
+                labels = labels.to(DEVICE)
+                future_feats = future_feats.to(DEVICE)
+                store_idx = store_idx.to(DEVICE)
+                item_idx = item_idx.to(DEVICE)
+                weights = (
+                    torch.tensor([item_weights[item] for item in batch_item_ids], dtype=torch.float32)
+                    .unsqueeze(1)
+                    .to(DEVICE)
+                )
+                outputs = model(
+                    inputs, store_idx, item_idx, curr_len, future_feats=future_feats
+                )
+                combined_w = weights * time_weights
+                batch_l1 = (criterion(outputs, labels) * combined_w).mean()
+                batch_smape = smape_loss_fn(outputs, labels, weights, time_weights).mean()
+                batch_loss = alpha * batch_l1 + (1 - alpha) * batch_smape
+                val_loss += batch_loss.item()
+                all_preds.append(outputs.cpu().numpy())
+                all_labels.append(labels.cpu().numpy())
+                all_item_ids.append(np.repeat(batch_item_ids, curr_len))
+
+        val_loss /= len(val_loader)
+
+        all_preds = np.concatenate(all_preds, axis=0)
+        all_labels = np.concatenate(all_labels, axis=0)
+        all_item_ids = np.concatenate(all_item_ids, axis=0)
+
+        all_preds_flat = all_preds.reshape(-1, 1)
+        all_labels_flat = all_labels.reshape(-1, 1)
+        all_preds_unscaled = np.zeros_like(all_preds_flat)
+        all_labels_unscaled = np.zeros_like(all_labels_flat)
+
+        for i in range(len(all_preds_flat)):
+            item_id = all_item_ids[i]
+            if item_id in scalers:
+                pred_unscaled = scalers[item_id].inverse_transform(
+                    all_preds_flat[i].reshape(-1, 1)
+                )
+                label_unscaled = scalers[item_id].inverse_transform(
+                    all_labels_flat[i].reshape(-1, 1)
+                )
+                pred_original = np.expm1(pred_unscaled)
+                label_original = np.expm1(label_unscaled)
+                pred_original[pred_original < 0] = 0
+                label_original[label_original < 0] = 0
+                all_preds_unscaled[i] = pred_original
+                all_labels_unscaled[i] = label_original
+            else:
+                all_preds_unscaled[i] = np.expm1(all_preds_flat[i])
+                all_labels_unscaled[i] = np.expm1(all_labels_flat[i])
+                all_preds_unscaled[i][all_preds_unscaled[i] < 0] = 0
+                all_labels_unscaled[i][all_labels_unscaled[i] < 0] = 0
+
+        val_smape = smape(all_labels_unscaled, all_preds_unscaled)
+        logging.info(
+            "Fine-tune Epoch %s: val_smape=%.4f", epoch + 1, val_smape
+        )
+        total_epoch += 1
+        if val_smape < fine_tune_best:
+            fine_tune_best = val_smape
+            best_val_smape = val_smape
+            torch.save(model.state_dict(), "best_lstm_model.pth")
+            logging.info(
+                "Fine-tune Epoch %s: Validation SMAPE improved to %.4f. Saving model...",
+                epoch + 1,
+                val_smape,
+            )
+
+    # Load the best model (either from initial training or fine-tuning)
     model.load_state_dict(torch.load("best_lstm_model.pth"))
     predict_and_submit(
         model,
