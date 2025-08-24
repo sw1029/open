@@ -124,6 +124,48 @@ def create_sequences(data: pd.DataFrame, features, target, seq_length, predict_l
     return np.array(xs), np.array(ys), np.array(item_ids)
 
 
+def time_warp(arr: np.ndarray, scale: float) -> np.ndarray:
+    """Resample array along time axis by a scaling factor while keeping length."""
+    n = arr.shape[0]
+    idx = np.arange(n)
+    warped_idx = idx * scale
+    if arr.ndim == 1:
+        return np.interp(idx, warped_idx, arr, left=arr[0], right=arr[-1])
+    warped = np.zeros_like(arr)
+    for col in range(arr.shape[1]):
+        warped[:, col] = np.interp(idx, warped_idx, arr[:, col], left=arr[0, col], right=arr[-1, col])
+    return warped
+
+
+def augment_sequences(X: np.ndarray, y: np.ndarray, item_ids: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Augment sequences for specific stores using noise, scaling and time warping."""
+    target_keywords = ['담하', '미라시아']
+    aug_X, aug_y, aug_ids = [], [], []
+    for x_seq, y_seq, item_id in zip(X, y, item_ids):
+        if any(keyword in item_id for keyword in target_keywords):
+            noise_x = x_seq + np.random.normal(0, 0.01, x_seq.shape)
+            noise_y = y_seq + np.random.normal(0, 0.01, y_seq.shape)
+            aug_X.append(noise_x)
+            aug_y.append(noise_y)
+            aug_ids.append(item_id)
+
+            scale_factor = np.random.uniform(0.9, 1.1)
+            aug_X.append(x_seq * scale_factor)
+            aug_y.append(y_seq * scale_factor)
+            aug_ids.append(item_id)
+
+            warp_factor = np.random.uniform(0.8, 1.2)
+            aug_X.append(time_warp(x_seq, warp_factor))
+            aug_y.append(time_warp(y_seq, warp_factor))
+            aug_ids.append(item_id)
+
+    if aug_X:
+        X = np.concatenate([X, np.array(aug_X)], axis=0)
+        y = np.concatenate([y, np.array(aug_y)], axis=0)
+        item_ids = np.concatenate([item_ids, np.array(aug_ids)], axis=0)
+    return X, y, item_ids
+
+
 class SalesDataset(Dataset):
     def __init__(self, X, y, item_ids):
         self.X = torch.tensor(X, dtype=torch.float32)
@@ -282,6 +324,10 @@ def prepare_datasets(sequence_length: int, predict_length: int, batch_size: int)
     features = features_to_scale
     train_data = combined_df[combined_df['매출수량'].notna()]
     X, y, item_ids = create_sequences(train_data, features, target_col, sequence_length, predict_length)
+
+    # Augment sequences for specified stores to expand training data
+    X, y, item_ids = augment_sequences(X, y, item_ids)
+
     X_train, X_val = X[:int(len(X)*0.9)], X[int(len(X)*0.9):]
     y_train, y_val = y[:int(len(y)*0.9)], y[int(len(y)*0.9):]
     item_ids_train, item_ids_val = item_ids[:int(len(item_ids)*0.9)], item_ids[int(len(item_ids)*0.9):]
