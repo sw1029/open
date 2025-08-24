@@ -379,6 +379,24 @@ def prepare_datasets(sequence_length: int, predict_length: int, batch_size: int)
     for lag in lags:
         test_df[f'lag_{lag}'] = test_df.groupby(['test_id', '영업장명_메뉴명'])['매출수량'].shift(lag)
 
+    # Rolling mean features
+    train_df['roll7'] = (
+        train_df.groupby('영업장명_메뉴명')['매출수량']
+        .transform(lambda x: x.shift(1).rolling(7).mean())
+    )
+    train_df['roll28'] = (
+        train_df.groupby('영업장명_메뉴명')['매출수량']
+        .transform(lambda x: x.shift(1).rolling(28).mean())
+    )
+    test_df['roll7'] = (
+        test_df.groupby(['test_id', '영업장명_메뉴명'])['매출수량']
+        .transform(lambda x: x.shift(1).rolling(7).mean())
+    )
+    test_df['roll28'] = (
+        test_df.groupby(['test_id', '영업장명_메뉴명'])['매출수량']
+        .transform(lambda x: x.shift(1).rolling(28).mean())
+    )
+
     corr_files = glob.glob('data/*.csv')
     corr_matrices = {os.path.basename(f).replace('.csv', ''): pd.read_csv(f, index_col=0) for f in corr_files}
     best_buddy_map = {
@@ -411,7 +429,7 @@ def prepare_datasets(sequence_length: int, predict_length: int, batch_size: int)
     )
     test_df.drop(columns=['메뉴명_buddy'], inplace=True)
 
-    cols_to_fill = [f'lag_{lag}' for lag in lags] + ['buddy_lag_1_sales']
+    cols_to_fill = [f'lag_{lag}' for lag in lags] + ['buddy_lag_1_sales', 'roll7', 'roll28']
     train_df[cols_to_fill] = train_df[cols_to_fill].fillna(0)
     test_df[cols_to_fill] = test_df[cols_to_fill].fillna(0)
 
@@ -429,7 +447,7 @@ def prepare_datasets(sequence_length: int, predict_length: int, batch_size: int)
 
     features_to_scale = ['dayofweek', 'month', '영업장명_encoded', '메뉴명_encoded',
                          'lag_1', 'lag_7', 'lag_14', 'lag_28', 'buddy_lag_1_sales',
-                         'is_holiday', 'season', 'is_event']
+                         'roll7', 'roll28', 'is_holiday', 'season', 'is_event']
     target_col = '매출수량'
 
     combined_df.loc[combined_df[target_col].notna(), target_col] = \
