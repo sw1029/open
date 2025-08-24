@@ -38,13 +38,19 @@ def main():
         "--decoder_steps",
         type=int,
         default=DEFAULT_PREDICT_LENGTH,
-        help="Number of time steps for the decoder to predict.",
+        help="Final number of time steps for the decoder to predict.",
     )
     args = parser.parse_args()
-    predict_length = args.decoder_steps
+    final_predict_length = args.decoder_steps
     num_heads = args.num_heads
 
+    logging.basicConfig(level=logging.INFO)
     print("PyTorch LSTM-based demand forecasting script started.")
+
+    curriculum_lengths = [1, 3, final_predict_length]
+    base_stage_epochs = NUM_EPOCHS // len(curriculum_lengths)
+    stage_epochs = [base_stage_epochs] * len(curriculum_lengths)
+    stage_epochs[-1] += NUM_EPOCHS - sum(stage_epochs)
 
     (
         train_loader,
@@ -58,7 +64,7 @@ def main():
         submission_to_date_map,
         test_indices,
         item_weights,
-    ) = prepare_datasets(SEQUENCE_LENGTH, predict_length, BATCH_SIZE)
+    ) = prepare_datasets(SEQUENCE_LENGTH, curriculum_lengths[0], BATCH_SIZE)
 
     model = Seq2Seq(
         input_size=len(features),
@@ -66,7 +72,7 @@ def main():
         num_layers=NUM_LAYERS,
         output_size=1,
         num_heads=num_heads,
-        decoder_steps=predict_length,
+        decoder_steps=final_predict_length,
     ).to(DEVICE)
     criterion = nn.SmoothL1Loss(reduction="none")
     smape_loss_fn = SMAPELoss(reduction="none")
@@ -76,96 +82,144 @@ def main():
     )
 
     best_val_smape = float("inf")
-    patience_counter = 0
+    stage_logs = []
 
-    epoch_iterator = tqdm(range(NUM_EPOCHS), desc="Training Epochs")
-    for epoch in epoch_iterator:
-        model.train()
-        for inputs, labels, batch_item_ids in train_loader:
-            inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
-            weights = (
-                torch.tensor([item_weights[item] for item in batch_item_ids], dtype=torch.float32)
-                .unsqueeze(1)
-                .to(DEVICE)
-            )
-            optimizer.zero_grad()
-            outputs = model(inputs, predict_length)
-            l1_loss = criterion(outputs, labels) * weights
-            smape_loss = smape_loss_fn(outputs, labels, weights)
-            loss = (l1_loss + smape_loss).mean()
-            loss.backward()
-            optimizer.step()
-
-        model.eval()
-        val_loss, all_preds, all_labels, all_item_ids = 0, [], [], []
-        with torch.no_grad():
-            for inputs, labels, batch_item_ids in val_loader:
+    for stage_idx, (curr_len, epochs) in enumerate(
+        zip(curriculum_lengths, stage_epochs), 1
+    ):
+        if stage_idx > 1:
+            (
+                train_loader,
+                val_loader,
+                scalers,
+                combined_df,
+                features,
+                target_col,
+                sample_submission_df,
+                submission_date_map,
+                submission_to_date_map,
+                test_indices,
+                item_weights,
+            ) = prepare_datasets(SEQUENCE_LENGTH, curr_len, BATCH_SIZE)
+        logging.info(
+            "Starting curriculum stage %s with predict_length=%s for %s epochs",
+            stage_idx,
+            curr_len,
+            epochs,
+        )
+        epoch_iterator = tqdm(
+            range(epochs),
+            desc=f"Stage {stage_idx} (predict_length={curr_len})",
+        )
+        stage_best_smape = float("inf")
+        patience_counter = 0
+        for epoch in epoch_iterator:
+            model.train()
+            for inputs, labels, batch_item_ids in train_loader:
                 inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
                 weights = (
                     torch.tensor([item_weights[item] for item in batch_item_ids], dtype=torch.float32)
                     .unsqueeze(1)
                     .to(DEVICE)
                 )
-                outputs = model(inputs, predict_length)
-                batch_loss = (
-                    criterion(outputs, labels) * weights
-                    + smape_loss_fn(outputs, labels, weights)
-                ).mean()
-                val_loss += batch_loss.item()
-                all_preds.append(outputs.cpu().numpy())
-                all_labels.append(labels.cpu().numpy())
-                all_item_ids.append(np.repeat(batch_item_ids, predict_length))
+                optimizer.zero_grad()
+                outputs = model(inputs, curr_len)
+                l1_loss = criterion(outputs, labels) * weights
+                smape_loss = smape_loss_fn(outputs, labels, weights)
+                loss = (l1_loss + smape_loss).mean()
+                loss.backward()
+                optimizer.step()
 
-        val_loss /= len(val_loader)
-        scheduler.step(val_loss)
+            model.eval()
+            val_loss, all_preds, all_labels, all_item_ids = 0, [], [], []
+            with torch.no_grad():
+                for inputs, labels, batch_item_ids in val_loader:
+                    inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
+                    weights = (
+                        torch.tensor([item_weights[item] for item in batch_item_ids], dtype=torch.float32)
+                        .unsqueeze(1)
+                        .to(DEVICE)
+                    )
+                    outputs = model(inputs, curr_len)
+                    batch_loss = (
+                        criterion(outputs, labels) * weights
+                        + smape_loss_fn(outputs, labels, weights)
+                    ).mean()
+                    val_loss += batch_loss.item()
+                    all_preds.append(outputs.cpu().numpy())
+                    all_labels.append(labels.cpu().numpy())
+                    all_item_ids.append(np.repeat(batch_item_ids, curr_len))
 
-        all_preds = np.concatenate(all_preds, axis=0)
-        all_labels = np.concatenate(all_labels, axis=0)
-        all_item_ids = np.concatenate(all_item_ids, axis=0)
+            val_loss /= len(val_loader)
+            scheduler.step(val_loss)
 
-        all_preds_flat = all_preds.reshape(-1, 1)
-        all_labels_flat = all_labels.reshape(-1, 1)
-        all_preds_unscaled = np.zeros_like(all_preds_flat)
-        all_labels_unscaled = np.zeros_like(all_labels_flat)
+            all_preds = np.concatenate(all_preds, axis=0)
+            all_labels = np.concatenate(all_labels, axis=0)
+            all_item_ids = np.concatenate(all_item_ids, axis=0)
 
-        for i in range(len(all_preds_flat)):
-            item_id = all_item_ids[i]
-            if item_id in scalers:
-                pred_unscaled = scalers[item_id].inverse_transform(
-                    all_preds_flat[i].reshape(-1, 1)
-                )
-                label_unscaled = scalers[item_id].inverse_transform(
-                    all_labels_flat[i].reshape(-1, 1)
-                )
-                pred_original = np.expm1(pred_unscaled)
-                label_original = np.expm1(label_unscaled)
-                pred_original[pred_original < 0] = 0
-                label_original[label_original < 0] = 0
-                all_preds_unscaled[i] = pred_original
-                all_labels_unscaled[i] = label_original
+            all_preds_flat = all_preds.reshape(-1, 1)
+            all_labels_flat = all_labels.reshape(-1, 1)
+            all_preds_unscaled = np.zeros_like(all_preds_flat)
+            all_labels_unscaled = np.zeros_like(all_labels_flat)
+
+            for i in range(len(all_preds_flat)):
+                item_id = all_item_ids[i]
+                if item_id in scalers:
+                    pred_unscaled = scalers[item_id].inverse_transform(
+                        all_preds_flat[i].reshape(-1, 1)
+                    )
+                    label_unscaled = scalers[item_id].inverse_transform(
+                        all_labels_flat[i].reshape(-1, 1)
+                    )
+                    pred_original = np.expm1(pred_unscaled)
+                    label_original = np.expm1(label_unscaled)
+                    pred_original[pred_original < 0] = 0
+                    label_original[label_original < 0] = 0
+                    all_preds_unscaled[i] = pred_original
+                    all_labels_unscaled[i] = label_original
+                else:
+                    all_preds_unscaled[i] = np.expm1(all_preds_flat[i])
+                    all_labels_unscaled[i] = np.expm1(all_labels_flat[i])
+                    all_preds_unscaled[i][all_preds_unscaled[i] < 0] = 0
+                    all_labels_unscaled[i][all_labels_unscaled[i] < 0] = 0
+
+            val_smape = smape(all_labels_unscaled, all_preds_unscaled)
+            epoch_iterator.set_postfix(val_loss=f"{val_loss:.6f}", val_smape=f"{val_smape:.4f}")
+
+            if val_smape < stage_best_smape:
+                stage_best_smape = val_smape
+                patience_counter = 0
+                if stage_idx == len(curriculum_lengths) and val_smape < best_val_smape:
+                    best_val_smape = val_smape
+                    torch.save(model.state_dict(), "best_lstm_model.pth")
+                    tqdm.write(
+                        f"Stage {stage_idx} Epoch {epoch+1}: Validation SMAPE improved to {val_smape:.4f}. Saving model..."
+                    )
+                else:
+                    tqdm.write(
+                        f"Stage {stage_idx} Epoch {epoch+1}: Validation SMAPE improved to {val_smape:.4f}"
+                    )
             else:
-                all_preds_unscaled[i] = np.expm1(all_preds_flat[i])
-                all_labels_unscaled[i] = np.expm1(all_labels_flat[i])
-                all_preds_unscaled[i][all_preds_unscaled[i] < 0] = 0
-                all_labels_unscaled[i][all_labels_unscaled[i] < 0] = 0
+                patience_counter += 1
+                if patience_counter >= PATIENCE:
+                    logging.info(
+                        "\nEarly stopping triggered in stage %s after %s epochs of no improvement.",
+                        stage_idx,
+                        PATIENCE,
+                    )
+                    break
 
-        val_smape = smape(all_labels_unscaled, all_preds_unscaled)
-        epoch_iterator.set_postfix(val_loss=f"{val_loss:.6f}", val_smape=f"{val_smape:.4f}")
+        stage_logs.append((curr_len, stage_best_smape))
+        logging.info(
+            "Stage %s completed with best val_smape=%.4f", stage_idx, stage_best_smape
+        )
 
-        if val_smape < best_val_smape:
-            best_val_smape = val_smape
-            patience_counter = 0
-            torch.save(model.state_dict(), "best_lstm_model.pth")
-            tqdm.write(
-                f"Epoch {epoch+1}: Validation SMAPE improved to {val_smape:.4f}. Saving model..."
-            )
-        else:
-            patience_counter += 1
-            if patience_counter >= PATIENCE:
-                print(
-                    f"\nEarly stopping triggered after {PATIENCE} epochs of no improvement."
-                )
-                break
+    for length, smape_val in stage_logs:
+        logging.info(
+            "Curriculum stage with predict_length=%s achieved best val_smape=%.4f",
+            length,
+            smape_val,
+        )
 
     model.load_state_dict(torch.load("best_lstm_model.pth"))
     predict_and_submit(
@@ -179,7 +233,7 @@ def main():
         submission_to_date_map,
         test_indices,
         SEQUENCE_LENGTH,
-        predict_length,
+        final_predict_length,
     )
 
 
