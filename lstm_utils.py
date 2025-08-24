@@ -197,14 +197,29 @@ class LSTMAttention(nn.Module):
 
 
 class Encoder(nn.Module):
-    """LSTM encoder that processes input sequences."""
+    """LSTM encoder preceded by a temporal convolution."""
 
-    def __init__(self, input_size: int, hidden_size: int, num_layers: int):
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int,
+        num_layers: int,
+        cnn_channels: int,
+        kernel_size: int,
+    ):
         super().__init__()
         if num_layers < 3:
             raise ValueError("Encoder expects num_layers to be at least 3")
+        # Temporal convolution over the feature dimension
+        padding = (kernel_size - 1) // 2
+        self.conv1d = nn.Conv1d(
+            in_channels=input_size,
+            out_channels=cnn_channels,
+            kernel_size=kernel_size,
+            padding=padding,
+        )
         self.lstm = nn.LSTM(
-            input_size,
+            cnn_channels,
             hidden_size,
             num_layers,
             batch_first=True,
@@ -213,6 +228,10 @@ class Encoder(nn.Module):
         )
 
     def forward(self, x: torch.Tensor):
+        # x expected shape: (batch, time, features)
+        x = x.transpose(1, 2)  # (batch, features, time)
+        x = self.conv1d(x)
+        x = x.transpose(1, 2)  # (batch, time, channels)
         outputs, (h, c) = self.lstm(x)
         # Combine forward and backward states for each layer
         h = torch.cat((h[0::2], h[1::2]), dim=2)
@@ -303,9 +322,19 @@ class Seq2Seq(nn.Module):
         output_size: int,
         num_heads: int,
         decoder_steps: int,
+        cnn_channels: int | None = None,
+        kernel_size: int = 3,
     ):
         super().__init__()
-        self.encoder = Encoder(input_size, hidden_size, num_layers)
+        if cnn_channels is None:
+            cnn_channels = input_size
+        self.encoder = Encoder(
+            input_size,
+            hidden_size,
+            num_layers,
+            cnn_channels,
+            kernel_size,
+        )
         self.decoder = Decoder(
             hidden_size * 2, num_layers, output_size, num_heads, decoder_steps
         )
