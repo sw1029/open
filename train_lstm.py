@@ -7,6 +7,7 @@ from tqdm import tqdm
 
 from lstm_utils import (
     DEVICE,
+    FUTURE_FEATURES,
     SMAPELoss,
     Seq2Seq,
     prepare_datasets,
@@ -98,6 +99,7 @@ def main():
         output_size=1,
         num_heads=num_heads,
         decoder_steps=final_predict_length,
+        future_feat_dim=len(FUTURE_FEATURES),
         cnn_channels=cnn_channels,
         kernel_size=kernel_size,
     ).to(DEVICE)
@@ -143,15 +145,25 @@ def main():
         for epoch in epoch_iterator:
             update_sampling_prob(epoch)
             model.train()
-            for inputs, labels, batch_item_ids in train_loader:
-                inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
+            for inputs, labels, batch_item_ids, future_feats in train_loader:
+                inputs, labels, future_feats = (
+                    inputs.to(DEVICE),
+                    labels.to(DEVICE),
+                    future_feats.to(DEVICE),
+                )
                 weights = (
                     torch.tensor([item_weights[item] for item in batch_item_ids], dtype=torch.float32)
                     .unsqueeze(1)
                     .to(DEVICE)
                 )
                 optimizer.zero_grad()
-                outputs = model(inputs, curr_len, labels, SCHEDULED_SAMPLING_PROB)
+                outputs = model(
+                    inputs,
+                    future_feats,
+                    curr_len,
+                    labels,
+                    SCHEDULED_SAMPLING_PROB,
+                )
                 l1_loss = criterion(outputs, labels) * weights
                 smape_loss = smape_loss_fn(outputs, labels, weights)
                 loss = (l1_loss + smape_loss).mean()
@@ -161,14 +173,18 @@ def main():
             model.eval()
             val_loss, all_preds, all_labels, all_item_ids = 0, [], [], []
             with torch.no_grad():
-                for inputs, labels, batch_item_ids in val_loader:
-                    inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
+                for inputs, labels, batch_item_ids, future_feats in val_loader:
+                    inputs, labels, future_feats = (
+                        inputs.to(DEVICE),
+                        labels.to(DEVICE),
+                        future_feats.to(DEVICE),
+                    )
                     weights = (
                         torch.tensor([item_weights[item] for item in batch_item_ids], dtype=torch.float32)
                         .unsqueeze(1)
                         .to(DEVICE)
                     )
-                    outputs = model(inputs, curr_len)
+                    outputs = model(inputs, future_feats, curr_len)
                     batch_loss = (
                         criterion(outputs, labels) * weights
                         + smape_loss_fn(outputs, labels, weights)
