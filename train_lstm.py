@@ -53,16 +53,32 @@ class SMAPELoss(nn.Module):
         denominator = (torch.abs(y_true) + torch.abs(y_pred)) / 2 + self.eps
         return (numerator / denominator).mean()
 
+
+# 실제 날짜와 submission_date 간 매핑 딕셔너리 (예측 시 사용)
+submission_date_map = {}
+
+
 def get_future_date_str(date_str, days_to_add):
-    """ 'TEST_00+1일' 형식의 문자열 날짜를 days_to_add 만큼 더한 문자열을 반환 """
+    """
+    ``TEST_xx+N일`` 형식의 문자열을 입력 받아 days_to_add만큼 더한 문자열을 반환.
+    만약 실제 날짜(예: ``2023-01-01``)가 들어오면 미리 생성한 매핑을 통해
+    ``TEST_`` 형식으로 변환한 뒤 동일한 로직을 적용한다.
+    """
     try:
-        parts = date_str.replace('일','').split('+')
+        parts = date_str.replace('일', '').split('+')
         test_id = parts[0]
         day_num = int(parts[1])
         return f"{test_id}+{day_num + days_to_add}일"
     except (IndexError, ValueError):
-         # 표준 날짜 형식이 들어올 경우 처리 (예: '2023-01-01')
-        return str(pd.to_datetime(date_str) + pd.Timedelta(days=days_to_add))
+        # 표준 날짜 형식이 들어올 경우 mapping 을 통해 TEST 형식으로 변환
+        base = submission_date_map.get(str(pd.to_datetime(date_str).date()))
+        if base:
+            parts = base.replace('일', '').split('+')
+            test_id = parts[0]
+            day_num = int(parts[1])
+            return f"{test_id}+{day_num + days_to_add}일"
+        future_date = pd.to_datetime(date_str) + pd.Timedelta(days=days_to_add)
+        return f"TEST_{future_date.strftime('%Y-%m-%d')}"
 
 # --- 1. 데이터 로딩 및 피처 엔지니어링 ---
 print("Step 1: Loading and feature engineering...")
@@ -77,6 +93,9 @@ for file in test_files:
     temp_df['submission_date'] = [f"{test_id}+{i+1}일" for i in range(len(temp_df))]
     test_df_list.append(temp_df)
 test_df = pd.concat(test_df_list, ignore_index=True)
+# submission_date <-> 실제 날짜 매핑 생성
+submission_date_map = test_df.set_index(test_df['영업일자'].astype(str))['submission_date'].to_dict()
+submission_to_date_map = test_df.set_index('submission_date')['영업일자'].astype(str).to_dict()
 sample_submission_df = pd.read_csv('sample_submission.csv')
 
 def create_features_train(df):
@@ -353,8 +372,11 @@ model.eval()
 # 전체 데이터프레임 복사하여 예측용으로 사용
 recursive_df = combined_df.copy()
 
-# 예측 대상이 되는 날짜들을 순서대로 가져옴
-prediction_dates = sorted(recursive_df[recursive_df['매출수량'].isna()]['영업일자'].unique())
+# 예측 대상이 되는 날짜들을 submission_date 기준으로 정렬하여 가져옴
+prediction_dates = sorted(
+    recursive_df[recursive_df['매출수량'].isna()]['submission_date'].unique(),
+    key=lambda x: (x.split('+')[0], int(x.split('+')[1].replace('일', '')))
+)
 
 # 예측 대상 인덱스 저장 (최종 결과 추출용)
 test_indices = recursive_df[recursive_df['매출수량'].isna()].index
@@ -363,10 +385,15 @@ with torch.no_grad():
     for start_idx in tqdm(range(0, len(prediction_dates), PREDICT_LENGTH), desc="Recursive Prediction by Date"):
         current_dates = prediction_dates[start_idx:start_idx + PREDICT_LENGTH]
 
-        batch_item_ids = recursive_df[recursive_df['영업일자'].isin(current_dates)]['영업장명_메뉴명'].unique()
+        batch_item_ids = recursive_df[recursive_df['submission_date'].isin(current_dates)]['영업장명_메뉴명'].unique()
         batch_predictions = {}
         for item_id in batch_item_ids:
-            item_history = recursive_df[(recursive_df['영업장명_메뉴명'] == item_id) & (recursive_df['영업일자'] < current_dates[0])]
+            # submission_date 를 실제 날짜로 변환하여 과거 기록 필터링
+            cutoff_date = submission_to_date_map.get(current_dates[0], current_dates[0])
+            item_history = recursive_df[
+                (recursive_df['영업장명_메뉴명'] == item_id)
+                & (recursive_df['영업일자'] < cutoff_date)
+            ]
             sequence_data = item_history.tail(SEQUENCE_LENGTH)
             if len(sequence_data) < SEQUENCE_LENGTH or sequence_data[target_col].isna().all():
                 buddy_id = recursive_df.loc[
@@ -374,9 +401,10 @@ with torch.no_grad():
                 ].iloc[0]
                 init_val = np.nan
                 if pd.notna(buddy_id):
+                    buddy_cutoff = submission_to_date_map.get(current_dates[0], current_dates[0])
                     buddy_history = recursive_df[
                         (recursive_df['영업장명_메뉴명'] == buddy_id)
-                        & (recursive_df['영업일자'] < current_dates[0])
+                        & (recursive_df['영업일자'] < buddy_cutoff)
                     ]
                     buddy_sales = buddy_history[target_col].dropna()
                     if not buddy_sales.empty:
@@ -397,7 +425,7 @@ with torch.no_grad():
 
             for item_id, pred_val in day_predictions.items():
                 idx_to_update = recursive_df[
-                    (recursive_df['영업일자'] == current_date) &
+                    (recursive_df['submission_date'] == current_date) &
                     (recursive_df['영업장명_메뉴명'] == item_id)
                 ].index
                 if not idx_to_update.empty:
@@ -407,14 +435,14 @@ with torch.no_grad():
                 for lag_days in [1, 7, 14]:
                     future_date = get_future_date_str(current_date, lag_days)
                     future_idx = recursive_df.index[
-                        (recursive_df['영업일자'] == future_date) &
+                        (recursive_df['submission_date'] == future_date) &
                         (recursive_df['영업장명_메뉴명'] == item_id)
                     ]
                     if not future_idx.empty:
                         recursive_df.loc[future_idx[0], f'lag_{lag_days}'] = pred_val
 
             next_day = get_future_date_str(current_date, 1)
-            next_day_rows_idx = recursive_df[recursive_df['영업일자'] == next_day].index
+            next_day_rows_idx = recursive_df[recursive_df['submission_date'] == next_day].index
             for idx in next_day_rows_idx:
                 buddy_item_id = recursive_df.loc[idx, 'best_buddy']
                 if pd.notna(buddy_item_id) and buddy_item_id in day_predictions:
