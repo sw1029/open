@@ -31,26 +31,51 @@ def smape(y_true, y_pred):
     ratio = np.where(denominator == 0, 0, numerator / denominator)
     return np.mean(ratio) * 100
 
+def get_future_date_str(date_str, days_to_add):
+    """ 'TEST_00+1일' 형식의 문자열 날짜를 days_to_add 만큼 더한 문자열을 반환 """
+    try:
+        parts = date_str.replace('일','').split('+')
+        test_id = parts[0]
+        day_num = int(parts[1])
+        return f"{test_id}+{day_num + days_to_add}일"
+    except (IndexError, ValueError):
+         # 표준 날짜 형식이 들어올 경우 처리 (예: '2023-01-01')
+        return str(pd.to_datetime(date_str) + pd.Timedelta(days=days_to_add))
+
 # --- 1. 데이터 로딩 및 피처 엔지니어링 ---
 print("Step 1: Loading and feature engineering...")
 train_df = pd.read_csv('train/train.csv')
 test_df = pd.concat([pd.read_csv(f) for f in glob.glob('test/*.csv')], ignore_index=True)
-sample_submission_df = pd.read_csv('sample_submission.csv') # NameError 해결
-sample_submission_df['영업일자'] = pd.to_datetime(sample_submission_df['영업일자'])
-train_df['source'] = 'train'
-test_df['source'] = 'test'
-combined_df = pd.concat([train_df, test_df], ignore_index=True)
-combined_df.loc[combined_df['source'] == 'test', '매출수량'] = np.nan
-print(f"DEBUG after concat: NaNs count = {combined_df['매출수량'].isna().sum()}")
+sample_submission_df = pd.read_csv('sample_submission.csv')
 
-def create_features(df):
+def create_features_train(df):
     df[['영업장명', '메뉴명']] = df['영업장명_메뉴명'].str.split('_', n=1, expand=True)
+    # train 데이터의 '영업일자'는 datetime으로 변환
     df['영업일자'] = pd.to_datetime(df['영업일자'])
     df['dayofweek'] = df['영업일자'].dt.dayofweek
     df['month'] = df['영업일자'].dt.month
     return df
 
-combined_df = create_features(combined_df)
+def create_features_test(df):
+    df[['영업장명', '메뉴명']] = df['영업장명_메뉴명'].str.split('_', n=1, expand=True)
+    # test 데이터는 날짜 변환 없이 placeholder 값으로 채움
+    df['dayofweek'] = -1 
+    df['month'] = -1
+    return df
+
+# train_df와 test_df에 각각 다른 피처 엔지니어링 함수 적용
+train_df = create_features_train(train_df)
+test_df = create_features_test(test_df)
+
+# 이후 처리를 위해 test_df의 '영업일자'를 문자열로 명시적 변환
+train_df['영업일자'] = train_df['영업일자'].astype(str)
+test_df['영업일자'] = test_df['영업일자'].astype(str)
+
+
+train_df['source'] = 'train'
+test_df['source'] = 'test'
+combined_df = pd.concat([train_df, test_df], ignore_index=True)
+combined_df.loc[combined_df['source'] == 'test', '매출수량'] = np.nan
 print(f"DEBUG after create_features: NaNs count = {combined_df['매출수량'].isna().sum()}")
 
 for col in ['영업장명', '메뉴명']:
@@ -206,7 +231,7 @@ model.eval()
 recursive_df = combined_df.copy()
 
 # 예측 대상이 되는 날짜들을 순서대로 가져옴
-prediction_dates = sorted(pd.to_datetime(recursive_df[recursive_df['매출수량'].isna()]['영업일자'].unique()))
+prediction_dates = sorted(recursive_df[recursive_df['매출수량'].isna()]['영업일자'].unique())
 
 # 예측 대상 인덱스 저장 (최종 결과 추출용)
 test_indices = recursive_df[recursive_df['매출수량'].isna()].index
@@ -248,7 +273,7 @@ with torch.no_grad():
         # lag_1, lag_7, lag_14 업데이트
         for item_id, pred_val in todays_predictions.items():
             for lag_days in [1, 7, 14]:
-                future_date = current_date + pd.Timedelta(days=lag_days)
+                future_date = get_future_date_str(current_date, lag_days)
                 future_idx = recursive_df.index[
                     (recursive_df['영업일자'] == future_date) &
                     (recursive_df['영업장명_메뉴명'] == item_id)
@@ -257,7 +282,7 @@ with torch.no_grad():
                     recursive_df.loc[future_idx[0], f'lag_{lag_days}'] = pred_val
 
         # buddy_lag_1_sales 업데이트
-        next_day = current_date + pd.Timedelta(days=1)
+        next_day = get_future_date_str(current_date, 1)
         next_day_rows_idx = recursive_df[recursive_df['영업일자'] == next_day].index
         for idx in next_day_rows_idx:
             buddy_item_id = recursive_df.loc[idx, 'best_buddy']
