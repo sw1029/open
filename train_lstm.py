@@ -34,6 +34,20 @@ def update_sampling_prob(epoch: int) -> None:
     SCHEDULED_SAMPLING_PROB = min(0.5, 0.1 + 0.02 * epoch)
 
 
+def get_alpha(epoch: int) -> float:
+    """Compute L1 loss weight based on epoch.
+
+    The weight starts at 0.5 for the first 20% of epochs and then
+    linearly decays to 0 by the final epoch.
+    """
+    warmup_epochs = int(0.2 * NUM_EPOCHS)
+    if epoch < warmup_epochs:
+        return 0.5
+    decay_epochs = max(1, NUM_EPOCHS - warmup_epochs)
+    progress = (epoch - warmup_epochs) / decay_epochs
+    return max(0.0, 0.5 * (1 - progress))
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -110,6 +124,7 @@ def main():
 
     best_val_smape = float("inf")
     stage_logs = []
+    total_epoch = 0
 
     for stage_idx, (curr_len, epochs) in enumerate(
         zip(curriculum_lengths, stage_epochs), 1
@@ -142,6 +157,7 @@ def main():
         patience_counter = 0
         for epoch in epoch_iterator:
             update_sampling_prob(epoch)
+            alpha = get_alpha(total_epoch)
             model.train()
             for inputs, labels, batch_item_ids in train_loader:
                 inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
@@ -152,9 +168,9 @@ def main():
                 )
                 optimizer.zero_grad()
                 outputs = model(inputs, curr_len, labels, SCHEDULED_SAMPLING_PROB)
-                l1_loss = criterion(outputs, labels) * weights
-                smape_loss = smape_loss_fn(outputs, labels, weights)
-                loss = (l1_loss + smape_loss).mean()
+                l1_loss = (criterion(outputs, labels) * weights).mean()
+                smape_loss = smape_loss_fn(outputs, labels, weights).mean()
+                loss = alpha * l1_loss + (1 - alpha) * smape_loss
                 loss.backward()
                 optimizer.step()
 
@@ -169,10 +185,9 @@ def main():
                         .to(DEVICE)
                     )
                     outputs = model(inputs, curr_len)
-                    batch_loss = (
-                        criterion(outputs, labels) * weights
-                        + smape_loss_fn(outputs, labels, weights)
-                    ).mean()
+                    batch_l1 = (criterion(outputs, labels) * weights).mean()
+                    batch_smape = smape_loss_fn(outputs, labels, weights).mean()
+                    batch_loss = alpha * batch_l1 + (1 - alpha) * batch_smape
                     val_loss += batch_loss.item()
                     all_preds.append(outputs.cpu().numpy())
                     all_labels.append(labels.cpu().numpy())
@@ -180,7 +195,7 @@ def main():
 
             val_loss /= len(val_loader)
             scheduler.step(val_loss)
-
+            
             all_preds = np.concatenate(all_preds, axis=0)
             all_labels = np.concatenate(all_labels, axis=0)
             all_item_ids = np.concatenate(all_item_ids, axis=0)
@@ -224,6 +239,7 @@ def main():
                 SCHEDULED_SAMPLING_PROB,
                 val_smape,
             )
+            total_epoch += 1
 
             if val_smape < stage_best_smape:
                 stage_best_smape = val_smape
