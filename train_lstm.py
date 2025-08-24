@@ -48,9 +48,23 @@ def main():
         default=DEFAULT_PREDICT_LENGTH,
         help="Final number of time steps for the decoder to predict.",
     )
+    parser.add_argument(
+        "--cnn_channels",
+        type=int,
+        default=None,
+        help="Output channels of initial Conv1d block.",
+    )
+    parser.add_argument(
+        "--kernel_size",
+        type=int,
+        default=3,
+        help="Kernel size of initial Conv1d block.",
+    )
     args = parser.parse_args()
     final_predict_length = args.decoder_steps
     num_heads = args.num_heads
+    cnn_channels = args.cnn_channels
+    kernel_size = args.kernel_size
 
     logging.basicConfig(level=logging.INFO)
     print("PyTorch LSTM-based demand forecasting script started.")
@@ -74,6 +88,9 @@ def main():
         item_weights,
     ) = prepare_datasets(SEQUENCE_LENGTH, curriculum_lengths[0], BATCH_SIZE)
 
+    if cnn_channels is None:
+        cnn_channels = len(features)
+
     model = Seq2Seq(
         input_size=len(features),
         hidden_size=HIDDEN_SIZE,
@@ -81,6 +98,8 @@ def main():
         output_size=1,
         num_heads=num_heads,
         decoder_steps=final_predict_length,
+        cnn_channels=cnn_channels,
+        kernel_size=kernel_size,
     ).to(DEVICE)
     criterion = nn.SmoothL1Loss(reduction="none")
     smape_loss_fn = SMAPELoss(reduction="none")
