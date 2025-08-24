@@ -60,34 +60,11 @@ def main():
     stage_epochs = [base_stage_epochs] * len(curriculum_lengths)
     stage_epochs[-1] += NUM_EPOCHS - sum(stage_epochs)
 
-    (
-        train_loader,
-        val_loader,
-        scalers,
-        combined_df,
-        features,
-        target_col,
-        sample_submission_df,
-        submission_date_map,
-        submission_to_date_map,
-        test_indices,
-        item_weights,
-    ) = prepare_datasets(SEQUENCE_LENGTH, curriculum_lengths[0], BATCH_SIZE)
-
-    model = Seq2Seq(
-        input_size=len(features),
-        hidden_size=HIDDEN_SIZE,
-        num_layers=NUM_LAYERS,
-        output_size=1,
-        num_heads=num_heads,
-        decoder_steps=final_predict_length,
-    ).to(DEVICE)
-    criterion = nn.SmoothL1Loss(reduction="none")
-    smape_loss_fn = SMAPELoss(reduction="none")
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, "min", patience=5, factor=0.5, verbose=True
-    )
+    model = None
+    criterion = None
+    smape_loss_fn = None
+    optimizer = None
+    scheduler = None
 
     best_val_smape = float("inf")
     stage_logs = []
@@ -95,20 +72,34 @@ def main():
     for stage_idx, (curr_len, epochs) in enumerate(
         zip(curriculum_lengths, stage_epochs), 1
     ):
-        if stage_idx > 1:
-            (
-                train_loader,
-                val_loader,
-                scalers,
-                combined_df,
-                features,
-                target_col,
-                sample_submission_df,
-                submission_date_map,
-                submission_to_date_map,
-                test_indices,
-                item_weights,
-            ) = prepare_datasets(SEQUENCE_LENGTH, curr_len, BATCH_SIZE)
+        (
+            train_loader,
+            val_loader,
+            scalers,
+            combined_df,
+            features,
+            target_col,
+            sample_submission_df,
+            submission_date_map,
+            submission_to_date_map,
+            test_indices,
+            item_weights,
+        ) = prepare_datasets(SEQUENCE_LENGTH, curr_len, BATCH_SIZE)
+        if stage_idx == 1:
+            model = Seq2Seq(
+                input_size=len(features),
+                hidden_size=HIDDEN_SIZE,
+                num_layers=NUM_LAYERS,
+                output_size=1,
+                num_heads=num_heads,
+                decoder_steps=final_predict_length,
+            ).to(DEVICE)
+            criterion = nn.SmoothL1Loss(reduction="none")
+            smape_loss_fn = SMAPELoss(reduction="none")
+            optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, "min", patience=5, factor=0.5, verbose=True
+            )
         logging.info(
             "Starting curriculum stage %s with predict_length=%s for %s epochs",
             stage_idx,
