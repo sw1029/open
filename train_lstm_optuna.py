@@ -33,6 +33,7 @@ best_smape = float("inf")
     submission_date_map,
     submission_to_date_map,
     test_indices,
+    item_weights,
 ) = prepare_datasets(SEQUENCE_LENGTH, PREDICT_LENGTH, BATCH_SIZE)
 
 

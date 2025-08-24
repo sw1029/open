@@ -38,6 +38,7 @@ def main():
         submission_date_map,
         submission_to_date_map,
         test_indices,
+        item_weights,
     ) = prepare_datasets(SEQUENCE_LENGTH, PREDICT_LENGTH, BATCH_SIZE)
 
     model = LSTMAttention(
@@ -46,8 +47,8 @@ def main():
         num_layers=NUM_LAYERS,
         output_size=PREDICT_LENGTH,
     ).to(DEVICE)
-    criterion = nn.SmoothL1Loss()
-    smape_loss_fn = SMAPELoss()
+    criterion = nn.SmoothL1Loss(reduction="none")
+    smape_loss_fn = SMAPELoss(reduction="none")
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, "min", patience=5, factor=0.5, verbose=True
@@ -59,11 +60,18 @@ def main():
     epoch_iterator = tqdm(range(NUM_EPOCHS), desc="Training Epochs")
     for epoch in epoch_iterator:
         model.train()
-        for inputs, labels, _ in train_loader:
+        for inputs, labels, batch_item_ids in train_loader:
             inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
+            weights = (
+                torch.tensor([item_weights[item] for item in batch_item_ids], dtype=torch.float32)
+                .unsqueeze(1)
+                .to(DEVICE)
+            )
             optimizer.zero_grad()
             outputs = model(inputs)
-            loss = criterion(outputs, labels) + smape_loss_fn(outputs, labels)
+            l1_loss = criterion(outputs, labels) * weights
+            smape_loss = smape_loss_fn(outputs, labels, weights)
+            loss = (l1_loss + smape_loss).mean()
             loss.backward()
             optimizer.step()
 
@@ -72,8 +80,13 @@ def main():
         with torch.no_grad():
             for inputs, labels, batch_item_ids in val_loader:
                 inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
+                weights = (
+                    torch.tensor([item_weights[item] for item in batch_item_ids], dtype=torch.float32)
+                    .unsqueeze(1)
+                    .to(DEVICE)
+                )
                 outputs = model(inputs)
-                batch_loss = criterion(outputs, labels) + smape_loss_fn(outputs, labels)
+                batch_loss = (criterion(outputs, labels) * weights + smape_loss_fn(outputs, labels, weights)).mean()
                 val_loss += batch_loss.item()
                 all_preds.append(outputs.cpu().numpy())
                 all_labels.append(labels.cpu().numpy())
