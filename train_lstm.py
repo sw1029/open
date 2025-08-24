@@ -16,6 +16,7 @@ print(f"Using device: {DEVICE}")
 
 # 하이퍼파라미터
 SEQUENCE_LENGTH = 14
+PREDICT_LENGTH = 7  # 한 번에 예측할 타임스텝 수
 BATCH_SIZE = 64
 LEARNING_RATE = 0.001
 NUM_EPOCHS = 50  # 에포크 수 증가
@@ -65,9 +66,46 @@ def create_features_test(df):
     df['month'] = df['영업일자'].dt.month.fillna(-1).astype(int)
     return df
 
+def load_calendar_features(df, holiday_path='holidays.csv', event_path='events.csv'):
+    """
+    Load holiday, season and event information. If corresponding files are
+    missing, default values are used.
+    """
+    df['영업일자'] = pd.to_datetime(df['영업일자'])
+
+    if os.path.exists(holiday_path):
+        holiday_df = pd.read_csv(holiday_path)
+        holiday_dates = pd.to_datetime(holiday_df['date']).dt.strftime('%Y-%m-%d').tolist()
+        df['is_holiday'] = df['영업일자'].dt.strftime('%Y-%m-%d').isin(holiday_dates).astype(int)
+    else:
+        df['is_holiday'] = 0
+
+    if os.path.exists(event_path):
+        event_df = pd.read_csv(event_path)
+        event_dates = pd.to_datetime(event_df['date']).dt.strftime('%Y-%m-%d').tolist()
+        df['is_event'] = df['영업일자'].dt.strftime('%Y-%m-%d').isin(event_dates).astype(int)
+    else:
+        df['is_event'] = 0
+
+    def month_to_season(month):
+        if month in [12, 1, 2]:
+            return 0  # Winter
+        elif month in [3, 4, 5]:
+            return 1  # Spring
+        elif month in [6, 7, 8]:
+            return 2  # Summer
+        else:
+            return 3  # Fall
+
+    df['season'] = df['month'].apply(month_to_season)
+    return df
+
 # train_df와 test_df에 각각 다른 피처 엔지니어링 함수 적용
 train_df = create_features_train(train_df)
 test_df = create_features_test(test_df)
+# 공휴일/계절/이벤트 정보 추가
+train_df = load_calendar_features(train_df)
+test_df = load_calendar_features(test_df)
 
 # 이후 처리를 위해 test_df의 '영업일자'를 문자열로 명시적 변환
 train_df['영업일자'] = train_df['영업일자'].astype(str)
@@ -114,7 +152,7 @@ print(f"DEBUG after targeted fillna: NaNs count = {combined_df['매출수량'].i
 
 # --- 2. 데이터 전처리 ---
 print("Step 2: Scaling and creating sequences...")
-features_to_scale = ['dayofweek', 'month', '영업장명_encoded', '메뉴명_encoded', 'lag_1', 'lag_7', 'lag_14', 'buddy_lag_1_sales']
+features_to_scale = ['dayofweek', 'month', '영업장명_encoded', '메뉴명_encoded', 'lag_1', 'lag_7', 'lag_14', 'buddy_lag_1_sales', 'is_holiday', 'season', 'is_event']
 target_col = '매출수량'
 
 # 로그 변환 적용 (매출수량이 NaN이 아닌 경우에만)
@@ -139,20 +177,20 @@ for item_id in tqdm(combined_df['영업장명_메뉴명'].unique(), desc="Scalin
         combined_df.loc[combined_df['영업장명_메뉴명'] == item_id, target_col] = scaler.transform(item_sales).flatten()
         scalers[item_id] = scaler
 
-def create_sequences(data, features, target, seq_length):
+def create_sequences(data, features, target, seq_length, predict_length):
     xs, ys, item_ids = [], [], []
     for item_id, group in data.groupby('영업장명_메뉴명'):
         feature_data = group[features].values
         target_data = group[target].values
-        for i in range(len(group) - seq_length):
+        for i in range(len(group) - seq_length - predict_length + 1):
             xs.append(feature_data[i:i+seq_length])
-            ys.append(target_data[i+seq_length])
+            ys.append(target_data[i+seq_length:i+seq_length+predict_length])
             item_ids.append(item_id)
     return np.array(xs), np.array(ys), np.array(item_ids)
 
 features = features_to_scale
 train_data = combined_df[combined_df['매출수량'].notna()]
-X, y, item_ids = create_sequences(train_data, features, [target_col], SEQUENCE_LENGTH)
+X, y, item_ids = create_sequences(train_data, features, target_col, SEQUENCE_LENGTH, PREDICT_LENGTH)
 
 X_train, X_val, y_train, y_val, item_ids_train, item_ids_val = \
     X[:int(len(X)*0.9)], X[int(len(X)*0.9):], \
@@ -179,18 +217,19 @@ val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
 # --- 4. LSTM 모델 정의 ---
 print("Step 4: Defining LSTM model...")
 class LSTMModel(nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers):
+    def __init__(self, input_size, hidden_size, num_layers, output_size):
         super(LSTMModel, self).__init__()
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=0.2)
-        self.fc = nn.Linear(hidden_size, 1)
+        self.fc = nn.Linear(hidden_size, output_size)
         self.activation = nn.ReLU()
+
     def forward(self, x):
         out, _ = self.lstm(x)
         out = self.fc(out[:, -1, :])
         out = self.activation(out)
         return out
 
-model = LSTMModel(input_size=len(features), hidden_size=HIDDEN_SIZE, num_layers=NUM_LAYERS).to(DEVICE)
+model = LSTMModel(input_size=len(features), hidden_size=HIDDEN_SIZE, num_layers=NUM_LAYERS, output_size=PREDICT_LENGTH).to(DEVICE)
 criterion = nn.MSELoss()
 optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5, verbose=True)
@@ -220,41 +259,39 @@ for epoch in epoch_iterator:
             val_loss += criterion(outputs, labels).item()
             all_preds.append(outputs.cpu().numpy())
             all_labels.append(labels.cpu().numpy())
-            all_item_ids.append(batch_item_ids)
+            all_item_ids.append(np.repeat(batch_item_ids, PREDICT_LENGTH))
     
     val_loss /= len(val_loader)
     scheduler.step(val_loss) # 스케줄러 step
 
-    all_preds = np.concatenate(all_preds)
-    all_labels = np.concatenate(all_labels)
-    all_item_ids = np.concatenate(all_item_ids)
+    all_preds = np.concatenate(all_preds, axis=0)
+    all_labels = np.concatenate(all_labels, axis=0)
+    all_item_ids = np.concatenate(all_item_ids, axis=0)
+
+    all_preds_flat = all_preds.reshape(-1, 1)
+    all_labels_flat = all_labels.reshape(-1, 1)
 
     # 역변환 로직
-    all_preds_unscaled = np.zeros_like(all_preds)
-    all_labels_unscaled = np.zeros_like(all_labels)
+    all_preds_unscaled = np.zeros_like(all_preds_flat)
+    all_labels_unscaled = np.zeros_like(all_labels_flat)
 
-    for i in range(len(all_preds)):
+    for i in range(len(all_preds_flat)):
         item_id = all_item_ids[i]
         if item_id in scalers:
-            # 스케일러 역변환
-            pred_unscaled = scalers[item_id].inverse_transform(all_preds[i].reshape(-1, 1))
-            label_unscaled = scalers[item_id].inverse_transform(all_labels[i].reshape(-1, 1))
-            
-            # 로그 변환 역변환
+            pred_unscaled = scalers[item_id].inverse_transform(all_preds_flat[i].reshape(-1, 1))
+            label_unscaled = scalers[item_id].inverse_transform(all_labels_flat[i].reshape(-1, 1))
+
             pred_original = np.expm1(pred_unscaled)
             label_original = np.expm1(label_unscaled)
-            
-            # 음수 값은 0으로 처리
+
             pred_original[pred_original < 0] = 0
             label_original[label_original < 0] = 0
-            
+
             all_preds_unscaled[i] = pred_original
             all_labels_unscaled[i] = label_original
         else:
-            # 스케일러가 없는 경우 (예외 처리 또는 0으로 처리)
-            # 이 경우는 발생하지 않아야 하지만, 안전을 위해 로그 역변환만 수행
-            all_preds_unscaled[i] = np.expm1(all_preds[i]) 
-            all_labels_unscaled[i] = np.expm1(all_labels[i])
+            all_preds_unscaled[i] = np.expm1(all_preds_flat[i])
+            all_labels_unscaled[i] = np.expm1(all_labels_flat[i])
             all_preds_unscaled[i][all_preds_unscaled[i] < 0] = 0
             all_labels_unscaled[i][all_labels_unscaled[i] < 0] = 0
     val_smape = smape(all_labels_unscaled, all_preds_unscaled)
@@ -291,60 +328,50 @@ prediction_dates = sorted(recursive_df[recursive_df['매출수량'].isna()]['영
 test_indices = recursive_df[recursive_df['매출수량'].isna()].index
 
 with torch.no_grad():
-    for current_date in tqdm(prediction_dates, desc="Recursive Prediction by Date"):
-        
-        # --- 1. 현재 날짜(current_date)에 대한 예측 수행 ---
-        rows_to_predict_idx = recursive_df[recursive_df['영업일자'] == current_date].index
-        todays_predictions = {} # {item_id: scaled_prediction}
+    for start_idx in tqdm(range(0, len(prediction_dates), PREDICT_LENGTH), desc="Recursive Prediction by Date"):
+        current_dates = prediction_dates[start_idx:start_idx + PREDICT_LENGTH]
 
-        for idx in rows_to_predict_idx:
-            item_id = recursive_df.loc[idx, '영업장명_메뉴명']
-            
-            # 입력 시퀀스 준비 (current_date 이전 데이터 사용)
-            item_history = recursive_df[(recursive_df['영업장명_메뉴명'] == item_id) & (recursive_df['영업일자'] < current_date)]
+        batch_item_ids = recursive_df[recursive_df['영업일자'].isin(current_dates)]['영업장명_메뉴명'].unique()
+        batch_predictions = {}
+        for item_id in batch_item_ids:
+            item_history = recursive_df[(recursive_df['영업장명_메뉴명'] == item_id) & (recursive_df['영업일자'] < current_dates[0])]
             sequence_data = item_history.tail(SEQUENCE_LENGTH)
-
-            if len(sequence_data) < SEQUENCE_LENGTH:
-                if len(sequence_data) > 0 and not sequence_data[target_col].isna().all():
-                    predicted_value_scaled = sequence_data[target_col].iloc[-1]
-                else:
-                    predicted_value_scaled = 0.01
+            if len(sequence_data) < SEQUENCE_LENGTH or sequence_data[target_col].isna().all():
+                predicted_seq = np.repeat(0.01, len(current_dates))
             else:
                 input_features = sequence_data[features].values
                 input_tensor = torch.tensor([input_features], dtype=torch.float32).to(DEVICE)
-                prediction_scaled = model(input_tensor)
-                predicted_value_scaled = prediction_scaled.cpu().numpy()[0][0]
-            
-            todays_predictions[item_id] = predicted_value_scaled
-        
-        # --- 2. 예측된 값으로 데이터프레임 업데이트 ---
-        for item_id, pred_val in todays_predictions.items():
-            idx_to_update = recursive_df[
-                (recursive_df['영업일자'] == current_date) & 
-                (recursive_df['영업장명_메뉴명'] == item_id)
-            ].index
-            if not idx_to_update.empty:
-                recursive_df.loc[idx_to_update, '매출수량'] = pred_val
+                prediction_scaled = model(input_tensor).cpu().numpy()[0]
+                predicted_seq = prediction_scaled[:len(current_dates)]
+            batch_predictions[item_id] = predicted_seq
 
-        # --- 3. 업데이트된 예측값을 기반으로 미래(future dates)의 피처 업데이트 ---
-        # lag_1, lag_7, lag_14 업데이트
-        for item_id, pred_val in todays_predictions.items():
-            for lag_days in [1, 7, 14]:
-                future_date = get_future_date_str(current_date, lag_days)
-                future_idx = recursive_df.index[
-                    (recursive_df['영업일자'] == future_date) &
+        for offset, current_date in enumerate(current_dates):
+            day_predictions = {item_id: preds[offset] for item_id, preds in batch_predictions.items()}
+
+            for item_id, pred_val in day_predictions.items():
+                idx_to_update = recursive_df[
+                    (recursive_df['영업일자'] == current_date) &
                     (recursive_df['영업장명_메뉴명'] == item_id)
-                ]
-                if not future_idx.empty:
-                    recursive_df.loc[future_idx[0], f'lag_{lag_days}'] = pred_val
+                ].index
+                if not idx_to_update.empty:
+                    recursive_df.loc[idx_to_update, '매출수량'] = pred_val
 
-        # buddy_lag_1_sales 업데이트
-        next_day = get_future_date_str(current_date, 1)
-        next_day_rows_idx = recursive_df[recursive_df['영업일자'] == next_day].index
-        for idx in next_day_rows_idx:
-            buddy_item_id = recursive_df.loc[idx, 'best_buddy']
-            if pd.notna(buddy_item_id) and buddy_item_id in todays_predictions:
-                recursive_df.loc[idx, 'buddy_lag_1_sales'] = todays_predictions[buddy_item_id]
+            for item_id, pred_val in day_predictions.items():
+                for lag_days in [1, 7, 14]:
+                    future_date = get_future_date_str(current_date, lag_days)
+                    future_idx = recursive_df.index[
+                        (recursive_df['영업일자'] == future_date) &
+                        (recursive_df['영업장명_메뉴명'] == item_id)
+                    ]
+                    if not future_idx.empty:
+                        recursive_df.loc[future_idx[0], f'lag_{lag_days}'] = pred_val
+
+            next_day = get_future_date_str(current_date, 1)
+            next_day_rows_idx = recursive_df[recursive_df['영업일자'] == next_day].index
+            for idx in next_day_rows_idx:
+                buddy_item_id = recursive_df.loc[idx, 'best_buddy']
+                if pd.notna(buddy_item_id) and buddy_item_id in day_predictions:
+                    recursive_df.loc[idx, 'buddy_lag_1_sales'] = day_predictions[buddy_item_id]
 
 
 # --- 4. 최종 결과 처리 ---
