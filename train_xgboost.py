@@ -8,13 +8,13 @@ import os
 print("XGBoost-based demand forecasting script with correlation features started.")
 
 # --- SMAPE 평가 지표 함수 정의 ---
-def smape(y_true, y_pred):
+def smape(y_true, y_pred, eps: float = 1e-8):
+    """SMAPE metric with a small epsilon in the denominator to avoid ``0/0``."""
     y_true = np.array(y_true)
     y_pred = np.array(y_pred)
     numerator = np.abs(y_pred - y_true)
-    denominator = (np.abs(y_true) + np.abs(y_pred)) / 2
-    ratio = np.where(denominator == 0, 0, numerator / denominator)
-    return np.mean(ratio) * 100
+    denominator = (np.abs(y_true) + np.abs(y_pred)) / 2 + eps
+    return np.mean(numerator / denominator) * 100
 
 # --- 1. 데이터 로딩 ---
 print("Step 1: Loading data...")
