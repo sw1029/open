@@ -88,14 +88,30 @@ test_df_list = []
 for file in test_files:
     temp_df = pd.read_csv(file)
     test_id = os.path.splitext(os.path.basename(file))[0]
-    temp_df['test_id'] = test_id
+    # 날짜 정렬 후 마지막 7행만 미래 예측 대상으로 처리
+    temp_df = temp_df.sort_values('영업일자')
     temp_df['영업일자'] = pd.to_datetime(temp_df['영업일자'])
-    temp_df['submission_date'] = [f"{test_id}+{i+1}일" for i in range(len(temp_df))]
+
+    past_df = temp_df.iloc[:-7].copy()
+    past_df['submission_date'] = past_df['영업일자'].dt.strftime('%Y-%m-%d')
+
+    future_df = temp_df.tail(7).copy().reset_index(drop=True)
+    future_df['submission_date'] = [f"{test_id}+{i+1}일" for i in range(len(future_df))]
+    future_df['매출수량'] = np.nan
+
+    temp_df = pd.concat([past_df, future_df], ignore_index=True)
+    temp_df['test_id'] = test_id
     test_df_list.append(temp_df)
+
 test_df = pd.concat(test_df_list, ignore_index=True)
+
 # submission_date <-> 실제 날짜 매핑 생성
 submission_date_map = test_df.set_index(test_df['영업일자'].astype(str))['submission_date'].to_dict()
 submission_to_date_map = test_df.set_index('submission_date')['영업일자'].astype(str).to_dict()
+expected_test_nans = 7 * len(test_files)
+actual_test_nans = test_df['매출수량'].isna().sum()
+if actual_test_nans != expected_test_nans:
+    raise ValueError(f"Unexpected number of NaNs in test data: {actual_test_nans} (expected {expected_test_nans})")
 sample_submission_df = pd.read_csv('sample_submission.csv')
 
 def create_features_train(df):
@@ -164,8 +180,12 @@ test_df['영업일자'] = test_df['영업일자'].astype(str)
 train_df['source'] = 'train'
 test_df['source'] = 'test'
 combined_df = pd.concat([train_df, test_df], ignore_index=True)
-combined_df.loc[combined_df['source'] == 'test', '매출수량'] = np.nan
-print(f"DEBUG after create_features: NaNs count = {combined_df['매출수량'].isna().sum()}")
+combined_nan_count = combined_df['매출수량'].isna().sum()
+print(f"DEBUG after create_features: NaNs count = {combined_nan_count}")
+if combined_nan_count != expected_test_nans:
+    raise ValueError(
+        f"Combined dataframe has {combined_nan_count} NaNs, expected {expected_test_nans}"
+    )
 
 for col in ['영업장명', '메뉴명']:
     le = LabelEncoder()
@@ -487,6 +507,8 @@ for item_id in tqdm(submission_df_for_inverse['영업장명_메뉴명'].unique()
 
 # 최종적으로 recursive_df에 역변환된 값을 반영
 recursive_df.loc[test_indices, '매출수량'] = submission_df_for_inverse['매출수량']
+if recursive_df.loc[test_indices, '매출수량'].isna().any():
+    raise ValueError("NaNs remain in predictions after inverse transform.")
 
 # --- 5. 제출 파일 생성 ---
 submission_df = (
@@ -494,6 +516,8 @@ submission_df = (
     .pivot_table(index='submission_date', columns='영업장명_메뉴명', values='매출수량')
     .reset_index()
 )
+if submission_df.isna().any().any():
+    raise ValueError("NaNs present after pivot operation.")
 final_submission = sample_submission_df[['영업일자']].merge(
     submission_df, left_on='영업일자', right_on='submission_date', how='left'
 )
