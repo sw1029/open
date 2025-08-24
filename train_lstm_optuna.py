@@ -7,7 +7,7 @@ from tqdm import tqdm
 from lstm_utils import (
     DEVICE,
     SMAPELoss,
-    LSTMAttention,
+    Seq2Seq,
     prepare_datasets,
     predict_and_submit,
     smape,
@@ -42,12 +42,16 @@ def objective(trial):
     hidden_size = trial.suggest_int("hidden_size", 64, 256)
     num_layers = trial.suggest_int("num_layers", 1, 3)
     lr = trial.suggest_float("lr", 1e-4, 1e-2, log=True)
+    num_heads = trial.suggest_int("num_heads", 1, 8)
+    decoder_steps = trial.suggest_int("decoder_steps", PREDICT_LENGTH, 14)
 
-    model = LSTMAttention(
+    model = Seq2Seq(
         input_size=len(features),
         hidden_size=hidden_size,
         num_layers=num_layers,
-        output_size=PREDICT_LENGTH,
+        num_heads=num_heads,
+        decoder_steps=decoder_steps,
+        output_size=1,
     ).to(DEVICE)
     criterion = nn.SmoothL1Loss()
     smape_loss_fn = SMAPELoss()
@@ -58,7 +62,7 @@ def objective(trial):
         for inputs, labels, _ in train_loader:
             inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
             optimizer.zero_grad()
-            outputs = model(inputs)
+            outputs = model(inputs)[:, :PREDICT_LENGTH]
             loss = criterion(outputs, labels) + smape_loss_fn(outputs, labels)
             loss.backward()
             optimizer.step()
@@ -68,7 +72,7 @@ def objective(trial):
     with torch.no_grad():
         for inputs, labels, batch_item_ids in val_loader:
             inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
-            outputs = model(inputs)
+            outputs = model(inputs)[:, :PREDICT_LENGTH]
             all_preds.append(outputs.cpu().numpy())
             all_labels.append(labels.cpu().numpy())
             all_item_ids.append(np.repeat(batch_item_ids, PREDICT_LENGTH))
@@ -112,11 +116,13 @@ study.optimize(objective, n_trials=50)
 
 best_trial = study.best_trial
 best_params = best_trial.params
-best_model = LSTMAttention(
+best_model = Seq2Seq(
     input_size=len(features),
     hidden_size=best_params["hidden_size"],
     num_layers=best_params["num_layers"],
-    output_size=PREDICT_LENGTH,
+    num_heads=best_params["num_heads"],
+    decoder_steps=best_params["decoder_steps"],
+    output_size=1,
 ).to(DEVICE)
 best_model_path = best_trial.user_attrs.get("best_model_path")
 if best_model_path:
@@ -130,7 +136,7 @@ for epoch in tqdm(range(RETRAIN_EPOCHS), desc="Training best model"):
     for inputs, labels, _ in train_loader:
         inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
         optimizer.zero_grad()
-        outputs = best_model(inputs)
+        outputs = best_model(inputs)[:, :PREDICT_LENGTH]
         loss = criterion(outputs, labels) + smape_loss_fn(outputs, labels)
         loss.backward()
         optimizer.step()
