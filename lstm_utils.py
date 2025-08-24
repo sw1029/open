@@ -201,6 +201,8 @@ class Encoder(nn.Module):
 
     def __init__(self, input_size: int, hidden_size: int, num_layers: int):
         super().__init__()
+        if num_layers < 3:
+            raise ValueError("Encoder expects num_layers to be at least 3")
         self.lstm = nn.LSTM(
             input_size,
             hidden_size,
@@ -230,6 +232,8 @@ class Decoder(nn.Module):
         decoder_steps: int,
     ):
         super().__init__()
+        if num_layers < 3:
+            raise ValueError("Decoder expects num_layers to be at least 3")
         self.decoder_steps = decoder_steps
         self.lstm = nn.LSTM(
             output_size, hidden_size, num_layers, batch_first=True, dropout=0.2
@@ -305,6 +309,8 @@ class Seq2Seq(nn.Module):
         self.decoder = Decoder(
             hidden_size * 2, num_layers, output_size, num_heads, decoder_steps
         )
+        # Projection for residual connection from the last encoder input.
+        self.residual_proj = nn.Linear(input_size, decoder_steps)
 
     def forward(
         self,
@@ -321,6 +327,9 @@ class Seq2Seq(nn.Module):
             targets,
             scheduled_sampling_prob,
         )
+        # Residual path projecting the last encoder input to decoder outputs.
+        residual = self.residual_proj(x[:, -1])
+        outputs = outputs + residual[:, : outputs.size(1)]
         return outputs
 
 
